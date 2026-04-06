@@ -236,7 +236,6 @@ def main():
                 results.append(result)
                 kept += 1
 
-            # 🔥 Progress print every 10
             if processed % 10 == 0 or processed == total:
                 elapsed = time.time() - start
                 rate = processed / elapsed if elapsed > 0 else 0
