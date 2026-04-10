@@ -11,7 +11,7 @@ STOCKFISH_PATH = r"stockfish"
 FEN_FILE = "30k_sampled_fens.txt"
 OUTPUT_CSV = "final_train_data.csv"
 
-BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
+BUCKETS = [25_000, 100_000, 400_000, 1_600_000] # x4 scale
 REFERENCE_NODES = 3_200_000
 
 # Hybrid regret constants
