@@ -53,7 +53,6 @@ def choose_bucket_label(row: pd.Series, tau_cp: int = TAU_CP) -> Optional[int]:
             return b
 
     # If no bucket satisfies tolerance, use largest bucket
-    # only if the regret columns exist at all.
     present_any = any((f"bucket_{b}_regret_cp" in row and pd.notna(row[f"bucket_{b}_regret_cp"])) for b in BUCKETS)
     return BUCKETS[-1] if present_any else None
 

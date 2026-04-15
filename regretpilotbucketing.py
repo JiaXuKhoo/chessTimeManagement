@@ -20,8 +20,8 @@ REGRET_TOLERANCE_CP = 20
 OVERFLOW_LABEL = f">{BUCKETS[-1]}"
 
 # Hybrid regret constants
-MATE_MISS_PENALTY_CP = 1000      # if ref finds mate and bucket does not
-MATE_PLY_PENALTY_CP = 50         # extra cp penalty per ply slower mate
+MATE_MISS_PENALTY_CP = 1000 # if ref finds mate and bucket does not
+MATE_PLY_PENALTY_CP = 50 # extra cp penalty per ply slower mate
 
 
 # -------------------------
