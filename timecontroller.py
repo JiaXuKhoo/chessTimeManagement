@@ -234,17 +234,19 @@ class ModelTimeController:
         Counts only non-king pieces.  Returns *per-side* moves, i.e.
         half-moves that this side still has to play.
         """
-        total_pieces = sum(
+        x = sum(
             1 for p in board.piece_map().values()
             if p.piece_type != chess.KING
         )
 
-        if total_pieces > 60:      # opening / early middlegame
-            return (5/2) * total_pieces - 60
-        elif (20 <= total_pieces <= 60):     # late middlegame
-            return (3/4) * total_pieces + 44
-        else:      # endgame
-            return 2 * total_pieces + 20
+        if x < 20:
+            y = x + 10
+        elif x <= 60:
+            y = (3 / 8) * x + 22
+        else:
+            y = (5 / 4) * x - 30
+
+        return max(1, int(y / 2))
 
 
     # ---------------------------------------------------------
