@@ -10,11 +10,13 @@ import chess.engine
 # Config
 # =========================================================
 
-STOCKFISH_PATH = r"C:\Users\khoo\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+STOCKFISH_PATH = "stockfish"
 INPUT_CSV = "dataset_static_tol20.csv"
 OUTPUT_CSV = "dataset_probe_tol20.csv"
 
-PROBE_NODES = 5000
+SMALL_PROBE_NODES = 2_000
+LARGE_PROBE_NODES = 5_000
+
 HASH_MB = 128
 THREADS = 1
 
@@ -43,7 +45,9 @@ def close_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
 # Score helpers
 # =========================================================
 
-def extract_score_info(score_obj: Optional[chess.engine.PovScore]) -> Tuple[Optional[str], Optional[int]]:
+def extract_score_info(
+    score_obj: Optional[chess.engine.PovScore]
+) -> Tuple[Optional[str], Optional[int]]:
     if score_obj is None:
         return None, None
 
@@ -57,10 +61,11 @@ def extract_score_info(score_obj: Optional[chess.engine.PovScore]) -> Tuple[Opti
     return "cp", cp if cp is not None else None
 
 
-def score_to_cp_for_gap(score_obj: Optional[chess.engine.PovScore]) -> Optional[int]:
+def score_to_cp(
+    score_obj: Optional[chess.engine.PovScore]
+) -> Optional[int]:
     """
-    Only use centipawn values for best-second gap.
-    If mate, return None.
+    Return centipawn score if available; if mate, return None.
     """
     if score_obj is None:
         return None
@@ -72,6 +77,47 @@ def score_to_cp_for_gap(score_obj: Optional[chess.engine.PovScore]) -> Optional[
     return white_score.score()
 
 
+def sign_of_cp(x: Optional[int]) -> int:
+    if x is None:
+        return 0
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
+
+
+# =========================================================
+# Probe helpers
+# =========================================================
+
+def unpack_probe_infos(infos) -> Tuple[Dict, Dict]:
+    """
+    Normalize MultiPV output into (pv1, pv2).
+    """
+    if isinstance(infos, list):
+        pv1 = infos[0] if len(infos) >= 1 else {}
+        pv2 = infos[1] if len(infos) >= 2 else {}
+    else:
+        pv1 = infos
+        pv2 = {}
+    return pv1, pv2
+
+
+def extract_top_move_uci(pv_info: Dict) -> Optional[str]:
+    pv = pv_info.get("pv", [])
+    return pv[0].uci() if pv else None
+
+
+def best_second_gap_cp(pv1: Dict, pv2: Dict) -> int:
+    cp1 = score_to_cp(pv1.get("score"))
+    cp2 = score_to_cp(pv2.get("score")) if pv2 else None
+
+    if cp1 is not None and cp2 is not None:
+        return cp1 - cp2
+    return 0
+
+
 # =========================================================
 # Probe extraction
 # =========================================================
@@ -79,8 +125,15 @@ def score_to_cp_for_gap(score_obj: Optional[chess.engine.PovScore]) -> Optional[
 def extract_probe_features_timed(
     engine: chess.engine.SimpleEngine,
     fen: str,
-    probe_nodes: int = PROBE_NODES
+    small_probe_nodes: int = SMALL_PROBE_NODES,
+    large_probe_nodes: int = LARGE_PROBE_NODES
 ) -> Tuple[Dict, Dict[str, float]]:
+    """
+    Uses the SAME engine for 2k -> 5k probing.
+    This means:
+    - the 5k probe naturally follows the earlier 2k search
+    - TT warming is preserved inside the staged probe process
+    """
     timings: Dict[str, float] = {}
     feats: Dict = {}
 
@@ -89,57 +142,72 @@ def extract_probe_features_timed(
     board = chess.Board(fen)
     timings["probe_board_construction_s"] = perf_counter() - t0
 
-    # Probe analyse
+    # -------------------------
+    # Small probe (2k)
+    # -------------------------
     t0 = perf_counter()
-    infos = engine.analyse(
+    infos_small = engine.analyse(
         board,
-        chess.engine.Limit(nodes=probe_nodes),
+        chess.engine.Limit(nodes=small_probe_nodes),
         multipv=2
     )
-    timings["probe_engine_analyse_s"] = perf_counter() - t0
+    timings["probe_small_engine_analyse_s"] = perf_counter() - t0
 
-    # Normalize result shape
+    # -------------------------
+    # large probe (5k) on same engine
+    # -------------------------
     t0 = perf_counter()
-    if isinstance(infos, list):
-        pv1 = infos[0] if len(infos) >= 1 else {}
-        pv2 = infos[1] if len(infos) >= 2 else {}
-    else:
-        pv1 = infos
-        pv2 = {}
+    infos_large = engine.analyse(
+        board,
+        chess.engine.Limit(nodes=large_probe_nodes),
+        multipv=2
+    )
+    timings["probe_large_engine_analyse_s"] = perf_counter() - t0
+
+    # Unpack both
+    t0 = perf_counter()
+    small_pv1, small_pv2 = unpack_probe_infos(infos_small)
+    large_pv1, large_pv2 = unpack_probe_infos(infos_large)
     timings["probe_result_unpack_s"] = perf_counter() - t0
 
-    # Score features
+    # =====================================================
+    # Probed features from large probe (5k)
+    # =====================================================
     t0 = perf_counter()
-    score_type, score_val = extract_score_info(pv1.get("score"))
-    feats["probe_score_type"] = score_type
-    feats["probe_score_cp"] = score_val if score_type == "cp" else None
-    feats["probe_abs_score_cp"] = abs(score_val) if score_type == "cp" and score_val is not None else None
-    feats["probe_is_mate"] = int(score_type == "mate")
-    feats["probe_mate_value"] = score_val if score_type == "mate" else None
-    timings["probe_score_features_s"] = perf_counter() - t0
 
-    # Depth features
+    large_score_type, large_score_val = extract_score_info(large_pv1.get("score"))
+
+    feats["probe_score_cp"] = large_score_val if large_score_type == "cp" else None
+    feats["probe_abs_score_cp"] = abs(large_score_val) if large_score_type == "cp" and large_score_val is not None else None
+    feats["probe_is_mate"] = int(large_score_type == "mate")
+    feats["probe_depth"] = large_pv1.get("depth")
+    feats["probe_seldepth"] = large_pv1.get("seldepth")
+    feats["probe_best_second_gap"] = best_second_gap_cp(large_pv1, large_pv2)
+
+    timings["probe_primary_features_s"] = perf_counter() - t0
+
+    # =====================================================
+    # 2-search Features
+    # =====================================================
     t0 = perf_counter()
-    feats["probe_depth"] = pv1.get("depth")
-    feats["probe_seldepth"] = pv1.get("seldepth")
-    timings["probe_depth_features_s"] = perf_counter() - t0
 
-    # Gap feature from MultiPV=2
-    t0 = perf_counter()
-    cp1 = score_to_cp_for_gap(pv1.get("score"))
-    cp2 = score_to_cp_for_gap(pv2.get("score")) if pv2 else None
+    small_cp = score_to_cp(small_pv1.get("score"))
+    large_cp = score_to_cp(large_pv1.get("score"))
 
-    if cp1 is not None and cp2 is not None:
-        feats["probe_best_second_gap"] = cp1 - cp2
-    else:
-        feats["probe_best_second_gap"] = 0
-    timings["probe_best_second_gap_s"] = perf_counter() - t0
+    small_gap = best_second_gap_cp(small_pv1, small_pv2)
+    large_gap = feats["probe_best_second_gap"]
 
-    # Optional bookkeeping
-    t0 = perf_counter()
-    feats["probe_nodes_requested"] = probe_nodes
-    feats["probe_nodes_reported"] = pv1.get("nodes")
-    timings["probe_bookkeeping_s"] = perf_counter() - t0
+    small_top_move = extract_top_move_uci(small_pv1)
+    large_top_move = extract_top_move_uci(large_pv1)
+
+    feats["probe_score_delta_small"] = abs(large_cp - small_cp) if small_cp is not None and large_cp is not None else 0
+    feats["probe_gap_delta_small"] = abs(large_gap - small_gap)
+    feats["probe_sign_flip"] = int(sign_of_cp(small_cp) != sign_of_cp(large_cp))
+    feats["probe_top_move_changed"] = int(
+        small_top_move is not None and large_top_move is not None and small_top_move != large_top_move
+    )
+
+    timings["probe_stability_features_s"] = perf_counter() - t0
 
     timings["total_probe_feature_overhead_s"] = sum(timings.values())
 
@@ -150,7 +218,10 @@ def extract_probe_features_timed(
 # Main dataset build
 # =========================================================
 
-def build_probe_dataset(input_csv: str = INPUT_CSV, output_csv: str = OUTPUT_CSV) -> None:
+def build_probe_dataset(
+    input_csv: str = INPUT_CSV,
+    output_csv: str = OUTPUT_CSV
+) -> None:
     df = pd.read_csv(input_csv)
 
     if "fen" not in df.columns:
@@ -172,9 +243,14 @@ def build_probe_dataset(input_csv: str = INPUT_CSV, output_csv: str = OUTPUT_CSV
             row_dict = row._asdict()
 
             try:
-                feats, timings = extract_probe_features_timed(engine, fen, probe_nodes=PROBE_NODES)
+                feats, timings = extract_probe_features_timed(
+                    engine,
+                    fen,
+                    small_probe_nodes=SMALL_PROBE_NODES,
+                    large_probe_nodes=LARGE_PROBE_NODES
+                )
 
-                out = dict(row_dict)   # keep static features + label if already present
+                out = dict(row_dict)   # preserve static features + label_bucket + tau_cp
                 out.update(feats)
                 out.update(timings)
                 rows.append(out)
@@ -203,7 +279,6 @@ def build_probe_dataset(input_csv: str = INPUT_CSV, output_csv: str = OUTPUT_CSV
     print(f"Rows: {len(out_df)}")
     print(f"Wall-clock total build time: {total_elapsed:.4f}s")
 
-    # Average timings
     avg_timings = {
         k: timing_sums[k] / max(timing_counts[k], 1)
         for k in timing_sums
