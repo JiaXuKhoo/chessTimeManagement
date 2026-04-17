@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import joblib
 
@@ -19,11 +20,21 @@ TARGET_COL = "label_bucket"
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 
-# Columns that are not features, we drop this
-DROP_COLS = {
-    "fen",          # fen strings
-    "tau_cp",       # constant metadata
-}
+# Explicit feature list for the new static-feature design
+FEATURE_COLS = [
+    "num_legal_moves",
+    "is_check",
+    "capture_ratio",
+    "check_ratio",
+    "num_promotions",
+    "knight_mobility",
+    "bishop_mobility",
+    "rook_mobility",
+    "queen_mobility",
+    "num_attackers_on_king",
+    "num_pinned_pieces",
+    "side_to_move_white",
+]
 
 # =========================================
 # Load data
@@ -31,19 +42,26 @@ DROP_COLS = {
 
 df = pd.read_csv(DATA_PATH)
 
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COL}' not found in {DATA_PATH}")
+
+missing_features = [c for c in FEATURE_COLS if c not in df.columns]
+if missing_features:
+    raise ValueError(
+        "The dataset is missing required feature columns:\n"
+        + "\n".join(missing_features)
+    )
+
 # Keep only rows that actually have a label
 df = df[df[TARGET_COL].notna()].copy()
 
-# Build the feature column list by dropping target + non-feature metadata
-feature_cols = [c for c in df.columns if c not in DROP_COLS and c != TARGET_COL]
-
-X = df[feature_cols].copy()
+X = df[FEATURE_COLS].copy()
 y = df[TARGET_COL].astype(int)
 
 print("Dataset shape:", df.shape)
-print("Number of features:", len(feature_cols))
+print("Number of features:", len(FEATURE_COLS))
 print("\nFeature columns:")
-print(feature_cols)
+print(FEATURE_COLS)
 
 print("\nOverall label distribution:")
 print(y.value_counts().sort_index())
@@ -54,7 +72,6 @@ print(y.value_counts(normalize=True).sort_index())
 # Train/test split
 # =========================================
 
-# Stratify=y keeps the class proportions similar in train and test
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
@@ -72,10 +89,7 @@ print(y_test.value_counts().sort_index())
 # Preprocessing + model
 # =========================================
 
-#fill missing values using the median of each column
 imputer = SimpleImputer(strategy="median")
-
-# Normalize features to zero mean / unit variance
 scaler = StandardScaler()
 
 model = LogisticRegression(
@@ -84,7 +98,6 @@ model = LogisticRegression(
     random_state=RANDOM_STATE
 )
 
-# Put both into one pipeline
 clf = Pipeline(steps=[
     ("imputer", imputer),
     ("scaler", scaler),
@@ -98,7 +111,7 @@ clf = Pipeline(steps=[
 clf.fit(X_train, y_train)
 
 # =========================================
-# Evaluate on normal imbalanced test set
+# Evaluate on original imbalanced test set
 # =========================================
 
 y_pred = clf.predict(X_test)
@@ -117,18 +130,14 @@ print(confusion_matrix(y_test, y_pred))
 # Create a balanced evaluation subset from TEST ONLY
 # =========================================
 
-# Recombine X_test and y_test so we can sample by class
 test_df = X_test.copy()
 test_df[TARGET_COL] = y_test.values
 
 print("\nTest-set class counts before balancing:")
 print(test_df[TARGET_COL].value_counts().sort_index())
 
-# Find the smallest class count in the TEST split
 min_test_class_size = test_df[TARGET_COL].value_counts().min()
 
-# Create a balanced subset by sampling the same number from each class
-# Sample each class separately, then concatenate
 balanced_parts = []
 for label, group in test_df.groupby(TARGET_COL):
     sampled_group = group.sample(n=min_test_class_size, random_state=RANDOM_STATE)
@@ -139,10 +148,9 @@ balanced_test_df = pd.concat(balanced_parts, axis=0).reset_index(drop=True)
 print("\nBalanced test-set class counts:")
 print(balanced_test_df[TARGET_COL].value_counts().sort_index())
 
-X_test_balanced = balanced_test_df[feature_cols]
+X_test_balanced = balanced_test_df[FEATURE_COLS]
 y_test_balanced = balanced_test_df[TARGET_COL].astype(int)
 
-# Predict on balanced evaluation subset
 y_pred_balanced = clf.predict(X_test_balanced)
 
 print("\n=== Evaluation on balanced test subset ===")
@@ -162,7 +170,7 @@ print(confusion_matrix(y_test_balanced, y_pred_balanced))
 hard_test_df = test_df[test_df[TARGET_COL] != 25000].copy()
 
 if len(hard_test_df) > 0:
-    X_test_hard = hard_test_df[feature_cols]
+    X_test_hard = hard_test_df[FEATURE_COLS]
     y_test_hard = hard_test_df[TARGET_COL].astype(int)
     y_pred_hard = clf.predict(X_test_hard)
 
@@ -180,9 +188,11 @@ if len(hard_test_df) > 0:
 # Save model
 # =========================================
 
+os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
+
 joblib.dump({
     "model": clf,
-    "feature_cols": feature_cols,
+    "feature_cols": FEATURE_COLS,
     "target_col": TARGET_COL,
 }, MODEL_OUT)
 
