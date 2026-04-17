@@ -1,25 +1,28 @@
 """
 run_tournament.py
 =================
-Compares the ML-driven TokenBucket controller against three baseline
-allocation policies under equal total node budgets.
+Parallel tournament runner with clean TT isolation.
 
 Policies tested:
-  1. FixedUniform   — total_budget / 50 every move (no adaptation)
-  2. SolakVuckovic  — remaining_budget / estimated_moves_left
-                      where moves_left uses the Šolak & Vučković (2009) formula
-  3. Hyatt          — front-loaded variant of (2) using Hyatt (1984) factor
-  4. TokenBucket    — ML classifier + token bucket (our system)
+  1. FixedUniform
+  2. SolakVuckovic
+  3. Hyatt
+  4. TokenBucket
 
-Supports both:
+Supports:
   - static-only models
   - probed-feature models matching getprobedfeatures.py
 
-Each matchup: 100 openings × 2 colours = 200 games.
-Each matchup is run in both discrete (snapped to buckets) and continuous mode.
+IMPORTANT TT DESIGN:
+- Each side gets its own Stockfish engine instance per game.
+- White and Black do NOT share a transposition table.
+- Engines are restarted between games, so TT does NOT carry across games/matchups.
+- TT is preserved across plies for the same side within a single game.
 
-Usage:
-  python run_tournament.py
+PARALLEL DESIGN:
+- 1 job = 1 opening + 1 matchup + 1 mode
+- each job runs 2 games (colour swap)
+- each worker owns its own engines within that job
 """
 
 import joblib
@@ -29,55 +32,70 @@ import pandas as pd
 import csv
 import os
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import multiprocessing as mp
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple, Any
 from abc import ABC, abstractmethod
+from collections import Counter
+
 
 # =========================================================
 # Config
 # =========================================================
 
 STOCKFISH_PATH = r"stockfish"
-
-#   gbt_static_tol20.joblib OR
-#   gbt_probe_tol20.joblib
 MODEL_PATH = "gbt_probe_tol20.joblib"
 OPENINGS_FILE = "openings_100.txt"
-# tournament_results_static OR
-# tournament_results_probe
 RESULTS_DIR = "tournament_results_probe"
 
 TOTAL_NODE_BUDGET = 10_000_000
 BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
 
-# Probe config (used only if model requires probe_* features)
 PROBE_NODES = 5000
 
-# =========================================================
-# Adjudication rules
-# =========================================================
-#
-# DRAW RULE — follows TCEC-like logic:
-#   From move 40 onward, if the eval stays within ±5cp for 10
-#   consecutive plies (5 full moves), adjudicate as a draw.
-#   A capture or pawn advance resets the counter.
-#
-# RESIGN RULE — justified for same-engine experimental play:
-#   If either side's eval reaches ≥500cp (in its favour) for 4
-#   consecutive plies, the losing side is adjudicated as resigning.
-#
-# BUDGET EXHAUSTION — time forfeit:
-#   If a side's node budget reaches zero before the game ends
-#   naturally, that side loses.
+# Quick-run control
+NUM_OPENINGS = 5          # None = use all openings
+
+# Debug
+DEBUG_CONTROLLER = True
+DEBUG_MAX_RECORDS_PER_JOB = 50
+DEBUG_PRINT_FIRST_N = 12
+
+# Adjudication
 MAX_PLIES = 400
 DRAW_MOVE_THRESHOLD = 40
 DRAW_CP_THRESHOLD = 5
 DRAW_CONSECUTIVE = 10
-RESIGN_CP_THRESHOLD = 500
-RESIGN_CONSECUTIVE = 4
+RESIGN_CP_THRESHOLD = 1000
+RESIGN_CONSECUTIVE = 5
 
 HASH_MB = 128
 THREADS = 1
+
+# Parallelism
+NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+
+
+# =========================================================
+# Engine helpers
+# =========================================================
+
+def open_engine() -> chess.engine.SimpleEngine:
+    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    engine.configure({
+        "Threads": THREADS,
+        "Hash": HASH_MB,
+    })
+    return engine
+
+
+def close_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
+    if engine is not None:
+        try:
+            engine.quit()
+        except Exception:
+            pass
+
 
 # =========================================================
 # Piece values
@@ -246,11 +264,10 @@ def extract_probe_features(
 
 
 # =========================================================
-# Moves-left estimator: Šolak & Vučković (2009)
+# Moves-left estimator
 # =========================================================
 
 def get_total_material(board: chess.Board) -> int:
-    """Sum of piece values for both sides, excluding kings."""
     x = 0
     for pt, v in PIECE_VALUES.items():
         x += v * len(board.pieces(pt, chess.WHITE))
@@ -259,14 +276,6 @@ def get_total_material(board: chess.Board) -> int:
 
 
 def estimate_moves_left(board: chess.Board) -> int:
-    """
-    Šolak & Vučković (2009) formula.
-    Maps total material x to remaining half-moves y, returns y/2 (per-side).
-
-      y = x + 10              if x < 20
-      y = (3/8)x + 22         if 20 <= x <= 60
-      y = (5/4)x - 30         if x > 60
-    """
     x = get_total_material(board)
 
     if x < 20:
@@ -280,11 +289,10 @@ def estimate_moves_left(board: chess.Board) -> int:
 
 
 # =========================================================
-# Snapping to discrete buckets
+# Bucket helper
 # =========================================================
 
 def snap_to_bucket(nodes: float) -> int:
-    """Largest discrete bucket that fits within the given node count."""
     affordable = [b for b in BUCKETS if b <= nodes]
     if affordable:
         return max(affordable)
@@ -296,8 +304,6 @@ def snap_to_bucket(nodes: float) -> int:
 # =========================================================
 
 class AllocationPolicy(ABC):
-    """Base class for all allocation policies."""
-
     def __init__(self, name: str, total_budget: int, use_discrete: bool):
         self.name = name
         self.total_budget = total_budget
@@ -317,7 +323,6 @@ class AllocationPolicy(ABC):
         self.remaining_budget = max(0, self.remaining_budget - nodes_used)
 
     def finalise(self, raw: float) -> int:
-        """Clamp to remaining budget and optionally snap to a discrete bucket."""
         raw = min(raw, self.remaining_budget)
         if self.use_discrete:
             raw = max(BUCKETS[0], raw)
@@ -329,82 +334,46 @@ class AllocationPolicy(ABC):
 
 
 class FixedUniformPolicy(AllocationPolicy):
-    """
-    Simplest possible baseline: total_budget / 50 every single move.
-    No adaptation to board state or remaining budget whatsoever.
-    """
-
     def __init__(self, total_budget: int, use_discrete: bool):
         super().__init__("FixedUniform", total_budget, use_discrete)
         self.fixed_allocation = total_budget / 50
 
-    def decide_nodes(
-        self,
-        engine: chess.engine.SimpleEngine,
-        board: chess.Board,
-        ply: int
-    ) -> int:
+    def decide_nodes(self, engine, board, ply) -> int:
         raw = min(self.fixed_allocation, self.remaining_budget)
         return self.finalise(raw)
 
 
 class SolakVuckovicPolicy(AllocationPolicy):
-    """
-    Divides remaining budget evenly among estimated remaining moves.
-    """
-
     def __init__(self, total_budget: int, use_discrete: bool):
         super().__init__("SolakVuckovic", total_budget, use_discrete)
 
-    def decide_nodes(
-        self,
-        engine: chess.engine.SimpleEngine,
-        board: chess.Board,
-        ply: int
-    ) -> int:
+    def decide_nodes(self, engine, board, ply) -> int:
         moves_left = estimate_moves_left(board)
         raw = self.remaining_budget / moves_left
         return self.finalise(raw)
 
 
 class HyattPolicy(AllocationPolicy):
-    """
-    Hyatt (1984) 'Using Time Wisely' style front-loaded scheme.
-    """
-
     def __init__(self, total_budget: int, use_discrete: bool):
         super().__init__("Hyatt", total_budget, use_discrete)
 
-    def decide_nodes(
-        self,
-        engine: chess.engine.SimpleEngine,
-        board: chess.Board,
-        ply: int
-    ) -> int:
+    def decide_nodes(self, engine, board, ply) -> int:
         moves_left = estimate_moves_left(board)
         target = self.remaining_budget / moves_left
-
         side_moves_played = ply // 2
         n = min(side_moves_played, 10)
         factor = 2.0 - n / 10.0
-
         raw = factor * target
         return self.finalise(raw)
 
 
 class TokenBucketPolicy(AllocationPolicy):
-    """
-    Supports both static-only and probed-feature models.
-
-    If any feature column begins with 'probe_', a small exploratory probe
-    search is run before prediction.
-    """
-
     def __init__(
         self,
         model_path: str,
         total_budget: int,
         use_discrete: bool,
+        debug_rows: Optional[List[Dict[str, Any]]] = None,
         burst_cap: int = BUCKETS[-1] * 2
     ):
         super().__init__("TokenBucket", total_budget, use_discrete)
@@ -412,23 +381,32 @@ class TokenBucketPolicy(AllocationPolicy):
         payload = joblib.load(model_path)
         self.model = payload["model"]
         self.feature_cols = payload["feature_cols"]
-
         self.uses_probe = any(col.startswith("probe_") for col in self.feature_cols)
 
         self.burst_cap = burst_cap
         self.tokens = float(burst_cap)
         self.refill_rate = total_budget / 50
 
+        self.debug_source_tag = "unset"
+        self.debug_rows = debug_rows if debug_rows is not None else []
+
     def reset(self):
         super().reset()
         self.tokens = float(self.burst_cap)
         self.refill_rate = self.total_budget / 50
 
-    def build_feature_row(
+    def set_debug_source_tag(self, tag: str):
+        self.debug_source_tag = tag
+
+    def add_debug_row(self, row: Dict[str, Any]) -> None:
+        if DEBUG_CONTROLLER and len(self.debug_rows) < DEBUG_MAX_RECORDS_PER_JOB:
+            self.debug_rows.append(row)
+
+    def build_feature_payload(
         self,
         engine: chess.engine.SimpleEngine,
         board: chess.Board
-    ) -> pd.DataFrame:
+    ) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
         feats = extract_static_features(board)
 
         if self.uses_probe:
@@ -436,10 +414,13 @@ class TokenBucketPolicy(AllocationPolicy):
             feats.update(probe_feats)
 
         row = {}
-        for col in self.feature_cols:
-            val = feats.get(col, 0)
+        raw_view = {}
 
-            # Defensive numeric sanitization
+        for col in self.feature_cols:
+            original_val = feats.get(col, 0)
+            raw_view[col] = original_val
+
+            val = original_val
             if val is None:
                 val = 0
             elif isinstance(val, str):
@@ -447,22 +428,50 @@ class TokenBucketPolicy(AllocationPolicy):
 
             row[col] = val
 
-        return pd.DataFrame([row], columns=self.feature_cols)
+        X = pd.DataFrame([row], columns=self.feature_cols)
+        return X, row, raw_view
 
-    def decide_nodes(
-        self,
-        engine: chess.engine.SimpleEngine,
-        board: chess.Board,
-        ply: int
-    ) -> int:
+    def decide_nodes(self, engine, board, ply) -> int:
         moves_left = estimate_moves_left(board)
         self.refill_rate = self.remaining_budget / moves_left
 
-        X = self.build_feature_row(engine, board)
+        X, sanitized_row, raw_view = self.build_feature_payload(engine, board)
         predicted = int(self.model.predict(X)[0])
 
         spendable = min(predicted, self.tokens, self.remaining_budget)
-        return self.finalise(spendable)
+        final_nodes = self.finalise(spendable)
+
+        interesting_cols = [
+            "num_legal_moves", "is_check", "total_material", "material_imbalance",
+            "total_pieces", "halfmove_clock", "num_captures", "num_checks",
+            "num_promotions", "knight_mobility", "bishop_mobility", "rook_mobility",
+            "queen_mobility", "num_attackers_on_king", "num_pinned_pieces",
+            "probe_score_cp", "probe_abs_score_cp", "probe_is_mate",
+            "probe_mate_value", "probe_depth", "probe_seldepth",
+            "probe_best_second_gap", "probe_nodes_requested", "probe_nodes_reported",
+        ]
+
+        feature_snapshot = {k: raw_view[k] for k in interesting_cols if k in raw_view}
+        sanitized_snapshot = {k: sanitized_row[k] for k in interesting_cols if k in sanitized_row}
+
+        self.add_debug_row({
+            "source_tag": self.debug_source_tag,
+            "ply": ply,
+            "turn_white": int(board.turn == chess.WHITE),
+            "fen": board.fen(),
+            "uses_probe": self.uses_probe,
+            "use_discrete": self.use_discrete,
+            "moves_left_estimate": moves_left,
+            "remaining_budget_before": self.remaining_budget,
+            "tokens_before": self.tokens,
+            "predicted_raw": predicted,
+            "spendable_before_finalise": spendable,
+            "final_nodes": final_nodes,
+            "feature_snapshot_raw": feature_snapshot,
+            "feature_snapshot_sanitized": sanitized_snapshot,
+        })
+
+        return final_nodes
 
     def consume(self, nodes_used: int):
         super().consume(nodes_used)
@@ -471,7 +480,7 @@ class TokenBucketPolicy(AllocationPolicy):
 
 
 # =========================================================
-# Game result
+# Results / jobs
 # =========================================================
 
 @dataclass
@@ -490,38 +499,78 @@ class GameResult:
     black_nodes_total: int
 
 
+@dataclass
+class MatchJob:
+    matchup_name: str
+    opening_idx: int
+    opening_fen: str
+    use_discrete: bool
+
+
+MATCHUP_REGISTRY = {
+    "TokenBucket_vs_FixedUniform": ("TokenBucket", "FixedUniform"),
+    "TokenBucket_vs_SolakVuckovic": ("TokenBucket", "SolakVuckovic"),
+    "TokenBucket_vs_Hyatt": ("TokenBucket", "Hyatt"),
+}
+
+
+# =========================================================
+# Policy factory
+# =========================================================
+
+def make_policy(
+    policy_name: str,
+    use_discrete: bool,
+    debug_rows: Optional[List[Dict[str, Any]]] = None
+) -> AllocationPolicy:
+    if policy_name == "TokenBucket":
+        return TokenBucketPolicy(MODEL_PATH, TOTAL_NODE_BUDGET, use_discrete, debug_rows=debug_rows)
+    if policy_name == "FixedUniform":
+        return FixedUniformPolicy(TOTAL_NODE_BUDGET, use_discrete)
+    if policy_name == "SolakVuckovic":
+        return SolakVuckovicPolicy(TOTAL_NODE_BUDGET, use_discrete)
+    if policy_name == "Hyatt":
+        return HyattPolicy(TOTAL_NODE_BUDGET, use_discrete)
+    raise ValueError(f"Unknown policy: {policy_name}")
+
+
 # =========================================================
 # Game runner
 # =========================================================
 
 def play_one_game(
-    engine: chess.engine.SimpleEngine,
+    white_engine: chess.engine.SimpleEngine,
+    black_engine: chess.engine.SimpleEngine,
     opening_fen: str,
     white_policy: AllocationPolicy,
     black_policy: AllocationPolicy,
     opening_idx: int,
 ) -> GameResult:
-    """
-    Play one game. Each side uses its own allocation policy and budget.
-    Both sides share the same Stockfish engine for move computation.
-    """
     board = chess.Board(opening_fen)
     white_policy.reset()
     black_policy.reset()
 
+    if isinstance(white_policy, TokenBucketPolicy):
+        white_policy.set_debug_source_tag(f"opening{opening_idx}_white_{white_policy.name}")
+    if isinstance(black_policy, TokenBucketPolicy):
+        black_policy.set_debug_source_tag(f"opening{opening_idx}_black_{black_policy.name}")
+
     w_nodes = 0
     b_nodes = 0
-
     draw_counter = 0
     resign_w = 0
     resign_b = 0
-
     ply = 0
     termination = "max_plies"
     budget_forfeit_side = None
 
     while not board.is_game_over() and ply < MAX_PLIES:
-        policy = white_policy if board.turn == chess.WHITE else black_policy
+        if board.turn == chess.WHITE:
+            engine = white_engine
+            policy = white_policy
+        else:
+            engine = black_engine
+            policy = black_policy
 
         if policy.remaining_budget <= 0:
             termination = "budget_forfeit"
@@ -557,7 +606,6 @@ def play_one_game(
             if cp is not None:
                 full_move = ply // 2 + 1
 
-                # Draw rule
                 if is_capture or is_pawn_move:
                     draw_counter = 0
                 elif full_move >= DRAW_MOVE_THRESHOLD and abs(cp) <= DRAW_CP_THRESHOLD:
@@ -571,7 +619,6 @@ def play_one_game(
                     termination = "draw_adjudication"
                     break
 
-                # Resign rule
                 if cp <= -RESIGN_CP_THRESHOLD:
                     resign_w += 1
                 else:
@@ -631,63 +678,53 @@ def play_one_game(
 
 
 # =========================================================
-# Matchup runner
+# Worker
 # =========================================================
 
-def run_matchup(
-    engine: chess.engine.SimpleEngine,
-    openings: List[str],
-    make_a,
-    make_b,
-    matchup_name: str,
-    use_discrete: bool,
-) -> List[GameResult]:
-    """
-    Run one matchup: each opening played twice with colour reversal.
-    A is the protagonist (controller), B is the baseline.
-    """
-    mode = "discrete" if use_discrete else "continuous"
-    total = len(openings) * 2
+def run_job(job: MatchJob) -> Tuple[MatchJob, List[GameResult], List[Dict[str, Any]]]:
+    debug_rows: List[Dict[str, Any]] = []
+    results: List[GameResult] = []
 
-    print(f"\n{'='*60}")
-    print(f"{matchup_name} ({mode}) — {total} games")
-    print(f"{'='*60}")
+    a_name, b_name = MATCHUP_REGISTRY[job.matchup_name]
 
-    results = []
+    # Game 1: A as White
+    white_engine = None
+    black_engine = None
+    try:
+        white_engine = open_engine()
+        black_engine = open_engine()
 
-    for idx, fen in enumerate(openings):
-        # Game 1: A=White, B=Black
-        a = make_a(use_discrete)
-        b = make_b(use_discrete)
-        g1 = play_one_game(engine, fen, a, b, idx)
+        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+        g1 = play_one_game(white_engine, black_engine, job.opening_fen, a, b, job.opening_idx)
         results.append(g1)
+    finally:
+        close_engine(white_engine)
+        close_engine(black_engine)
 
-        # Game 2: B=White, A=Black
-        a = make_a(use_discrete)
-        b = make_b(use_discrete)
-        g2 = play_one_game(engine, fen, b, a, idx)
+    # Game 2: B as White
+    white_engine = None
+    black_engine = None
+    try:
+        white_engine = open_engine()
+        black_engine = open_engine()
+
+        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+        g2 = play_one_game(white_engine, black_engine, job.opening_fen, b, a, job.opening_idx)
         results.append(g2)
+    finally:
+        close_engine(white_engine)
+        close_engine(black_engine)
 
-        if (idx + 1) % 10 == 0:
-            a_name = make_a(use_discrete).name
-            a_w = sum(
-                1 for r in results
-                if (r.white_policy == a_name and r.result == "1-0")
-                or (r.black_policy == a_name and r.result == "0-1")
-            )
-            a_l = sum(
-                1 for r in results
-                if (r.white_policy == a_name and r.result == "0-1")
-                or (r.black_policy == a_name and r.result == "1-0")
-            )
-            d = sum(1 for r in results if r.result == "1/2-1/2")
-            print(f"  [{idx+1}/{len(openings)}] {a_name}: +{a_w} ={d} -{a_l}")
+    return job, results, debug_rows
 
-    return results
 
+# =========================================================
+# Saving / reporting
+# =========================================================
 
 def summarise(results: List[GameResult], a_name: str):
-    """Print summary from policy A's perspective."""
     a_w = sum(
         1 for r in results
         if (r.white_policy == a_name and r.result == "1-0")
@@ -704,8 +741,7 @@ def summarise(results: List[GameResult], a_name: str):
     score = a_w + 0.5 * d
     pct = score / total * 100 if total else 0
 
-    print(f"\n  {a_name}: +{a_w} ={d} -{a_l} (*{u})  "
-          f"Score: {score}/{total} ({pct:.1f}%)")
+    print(f"\n  {a_name}: +{a_w} ={d} -{a_l} (*{u})  Score: {score}/{total} ({pct:.1f}%)")
 
     terms = {}
     for r in results:
@@ -714,7 +750,6 @@ def summarise(results: List[GameResult], a_name: str):
 
 
 def save_csv(results: List[GameResult], path: str):
-    """Write detailed results to CSV."""
     fields = [
         "opening_idx", "opening_fen", "white_policy", "black_policy",
         "discrete", "result", "termination", "total_plies",
@@ -725,30 +760,91 @@ def save_csv(results: List[GameResult], path: str):
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in results:
-            w.writerow({
-                "opening_idx": r.opening_idx,
-                "opening_fen": r.opening_fen,
-                "white_policy": r.white_policy,
-                "black_policy": r.black_policy,
-                "discrete": r.discrete,
-                "result": r.result,
-                "termination": r.termination,
-                "total_plies": r.total_plies,
-                "white_budget_remaining": r.white_budget_remaining,
-                "black_budget_remaining": r.black_budget_remaining,
-                "white_nodes_total": r.white_nodes_total,
-                "black_nodes_total": r.black_nodes_total,
-            })
+            w.writerow(asdict(r))
     print(f"  Saved: {path}")
+
+
+def print_debug_summary(debug_rows: List[Dict[str, Any]]):
+    if not DEBUG_CONTROLLER:
+        return
+
+    print(f"\n{'='*60}")
+    print("CONTROLLER DEBUG SUMMARY")
+    print(f"{'='*60}")
+
+    if not debug_rows:
+        print("No debug rows captured.")
+        return
+
+    print(f"Captured debug rows: {len(debug_rows)}")
+
+    predicted_counter = Counter(row["predicted_raw"] for row in debug_rows)
+    final_counter = Counter(row["final_nodes"] for row in debug_rows)
+
+    print("\nPredicted raw values frequency:")
+    for k, v in predicted_counter.most_common():
+        print(f"  {k}: {v}")
+
+    print("\nFinal allocated nodes frequency:")
+    for k, v in final_counter.most_common():
+        print(f"  {k}: {v}")
+
+    avg_pred = sum(row["predicted_raw"] for row in debug_rows) / len(debug_rows)
+    avg_final = sum(row["final_nodes"] for row in debug_rows) / len(debug_rows)
+    avg_spendable = sum(row["spendable_before_finalise"] for row in debug_rows) / len(debug_rows)
+
+    print(f"\nAverage predicted_raw: {avg_pred:.2f}")
+    print(f"Average spendable_before_finalise: {avg_spendable:.2f}")
+    print(f"Average final_nodes: {avg_final:.2f}")
+
+    unexpected_preds = [
+        row["predicted_raw"] for row in debug_rows
+        if row["use_discrete"] and row["predicted_raw"] not in BUCKETS
+    ]
+    if unexpected_preds:
+        print("\nWARNING: In discrete mode, some raw predictions are not one of the bucket values.")
+        print(f"Example unexpected predictions: {unexpected_preds[:10]}")
+
+    print(f"\nFirst {min(DEBUG_PRINT_FIRST_N, len(debug_rows))} debug rows:")
+    for i, row in enumerate(debug_rows[:DEBUG_PRINT_FIRST_N], start=1):
+        print(f"\n--- Debug row {i} ---")
+        print(f"source_tag                : {row['source_tag']}")
+        print(f"ply                       : {row['ply']}")
+        print(f"turn_white                : {row['turn_white']}")
+        print(f"uses_probe                : {row['uses_probe']}")
+        print(f"use_discrete              : {row['use_discrete']}")
+        print(f"moves_left_estimate       : {row['moves_left_estimate']}")
+        print(f"remaining_budget_before   : {row['remaining_budget_before']}")
+        print(f"tokens_before             : {row['tokens_before']:.2f}")
+        print(f"predicted_raw             : {row['predicted_raw']}")
+        print(f"spendable_before_finalise : {row['spendable_before_finalise']}")
+        print(f"final_nodes               : {row['final_nodes']}")
+        print(f"feature_snapshot_raw      : {row['feature_snapshot_raw']}")
+        print(f"feature_snapshot_sanitized: {row['feature_snapshot_sanitized']}")
+        print(f"fen                       : {row['fen']}")
 
 
 # =========================================================
 # Main
 # =========================================================
 
+def build_jobs(openings: List[str]) -> List[MatchJob]:
+    jobs: List[MatchJob] = []
+    for matchup_name in MATCHUP_REGISTRY:
+        for use_discrete in [True, False]:
+            for idx, fen in enumerate(openings):
+                jobs.append(MatchJob(
+                    matchup_name=matchup_name,
+                    opening_idx=idx,
+                    opening_fen=fen,
+                    use_discrete=use_discrete,
+                ))
+    return jobs
+
+
 def main():
     if not os.path.exists(OPENINGS_FILE):
-        print(f"ERROR: {OPENINGS_FILE} not found. Run generate_openings.py first.")
+        print(f"ERROR: {OPENINGS_FILE} not found.")
         return
 
     if not os.path.exists(MODEL_PATH):
@@ -757,54 +853,67 @@ def main():
 
     with open(OPENINGS_FILE, "r", encoding="utf-8") as f:
         openings = [line.strip() for line in f if line.strip()]
+
+    if NUM_OPENINGS is not None:
+        openings = openings[:NUM_OPENINGS]
+
     print(f"Loaded {len(openings)} openings")
+    print(f"MODEL_PATH={MODEL_PATH}")
+    print(f"NUM_OPENINGS={NUM_OPENINGS}")
+    print(f"NUM_WORKERS={NUM_WORKERS}")
+    print(f"DEBUG_CONTROLLER={DEBUG_CONTROLLER}")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    def make_controller(disc):
-        return TokenBucketPolicy(MODEL_PATH, TOTAL_NODE_BUDGET, disc)
+    jobs = build_jobs(openings)
+    total_jobs = len(jobs)
+    print(f"Built {total_jobs} jobs")
 
-    def make_fixed(disc):
-        return FixedUniformPolicy(TOTAL_NODE_BUDGET, disc)
-
-    def make_solak(disc):
-        return SolakVuckovicPolicy(TOTAL_NODE_BUDGET, disc)
-
-    def make_hyatt(disc):
-        return HyattPolicy(TOTAL_NODE_BUDGET, disc)
-
-    matchups = [
-        ("TokenBucket_vs_FixedUniform",   make_controller, make_fixed),
-        ("TokenBucket_vs_SolakVuckovic",  make_controller, make_solak),
-        ("TokenBucket_vs_Hyatt",          make_controller, make_hyatt),
-    ]
-
-    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-    engine.configure({"Threads": THREADS, "Hash": HASH_MB})
+    grouped_results: Dict[str, Dict[bool, List[GameResult]]] = {
+        matchup_name: {True: [], False: []}
+        for matchup_name in MATCHUP_REGISTRY
+    }
+    all_debug_rows: List[Dict[str, Any]] = []
 
     t0 = time.time()
 
-    try:
-        for name, make_a, make_b in matchups:
-            for use_discrete in [True, False]:
-                mode = "discrete" if use_discrete else "continuous"
+    with mp.Pool(NUM_WORKERS) as pool:
+        for i, (job, job_results, job_debug_rows) in enumerate(pool.imap_unordered(run_job, jobs), start=1):
+            grouped_results[job.matchup_name][job.use_discrete].extend(job_results)
+            if DEBUG_CONTROLLER:
+                all_debug_rows.extend(job_debug_rows)
 
-                results = run_matchup(
-                    engine, openings, make_a, make_b, name, use_discrete,
-                )
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0.0
+            eta = (total_jobs - i) / rate if rate > 0 else 0.0
 
-                a_name = make_a(use_discrete).name
-                summarise(results, a_name)
+            print(
+                f"Completed {i}/{total_jobs} jobs | "
+                f"Last: opening={job.opening_idx}, matchup={job.matchup_name}, "
+                f"mode={'discrete' if job.use_discrete else 'continuous'} | "
+                f"Elapsed={elapsed/60:.1f} min | ETA={eta/60:.1f} min",
+                flush=True,
+            )
 
-                csv_path = os.path.join(RESULTS_DIR, f"{name}_{mode}.csv")
-                save_csv(results, csv_path)
-    finally:
-        engine.quit()
+    for matchup_name, (a_name, _) in MATCHUP_REGISTRY.items():
+        for use_discrete in [True, False]:
+            mode = "discrete" if use_discrete else "continuous"
+            results = grouped_results[matchup_name][use_discrete]
+
+            print(f"\n{'='*60}")
+            print(f"{matchup_name} ({mode}) — {len(results)} games")
+            print(f"{'='*60}")
+            summarise(results, a_name)
+
+            csv_path = os.path.join(RESULTS_DIR, f"{matchup_name}_{mode}.csv")
+            save_csv(results, csv_path)
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
     print(f"Tournament complete in {elapsed/60:.1f} minutes")
     print(f"Results in {RESULTS_DIR}/")
+
+    print_debug_summary(all_debug_rows)
 
 
 if __name__ == "__main__":

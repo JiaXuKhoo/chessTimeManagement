@@ -18,7 +18,7 @@ BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
 REFERENCE_NODES = 3_200_000
 
 MATE_MISS_PENALTY_CP = 1000
-MATE_PLY_PENALTY_CP = 50
+MATE_PLY_PENALTY_CP = 5
 
 NUM_WORKERS = 16
 HASH_PER_WORKER_MB = 128
@@ -53,6 +53,12 @@ def score_kind_and_value(score: Optional[Tuple[str, int]]) -> Tuple[Optional[str
     return score[0], score[1]
 
 
+def weighted_cp_regret(ref_cp: int, bucket_cp: int, K: float = 100.0) -> int:
+    raw = max(0, ref_cp - bucket_cp)
+    weight = 1.0 / (1.0 + abs(ref_cp) / K)
+    return int(round(raw * weight))
+
+
 def compute_hybrid_regret(
     ref_score: Optional[Tuple[str, int]],
     bucket_score: Optional[Tuple[str, int]]
@@ -65,11 +71,10 @@ def compute_hybrid_regret(
 
     # Case 1: both cp
     if ref_type == "cp" and b_type == "cp":
-        return max(0, ref_val - b_val)
+        return weighted_cp_regret(ref_val, b_val, K=100.0)
 
     # Case 2: reference is mate
     if ref_type == "mate":
-        # mate >= 0 treated as winning/immediate mate for chosen side
         if ref_val >= 0:
             if b_type != "mate":
                 return MATE_MISS_PENALTY_CP
@@ -77,7 +82,6 @@ def compute_hybrid_regret(
                 return MATE_MISS_PENALTY_CP
             return max(0, (b_val - ref_val) * MATE_PLY_PENALTY_CP)
 
-        # reference is losing mate
         if ref_val < 0:
             if b_type == "mate" and b_val < 0:
                 return max(0, (abs(ref_val) - abs(b_val)) * MATE_PLY_PENALTY_CP)
