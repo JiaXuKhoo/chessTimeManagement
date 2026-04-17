@@ -1,7 +1,7 @@
 """
 run_tournament.py
 =================
-Parallel tournament runner with clean TT isolation.
+Parallel tournament runner with per-side TT isolation.
 
 Policies tested:
   1. FixedUniform
@@ -11,18 +11,16 @@ Policies tested:
 
 Supports:
   - static-only models
-  - probed-feature models matching getprobedfeatures.py
+  - probe models
 
 IMPORTANT TT DESIGN:
 - Each side gets its own Stockfish engine instance per game.
 - White and Black do NOT share a transposition table.
 - Engines are restarted between games, so TT does NOT carry across games/matchups.
-- TT is preserved across plies for the same side within a single game.
-
-PARALLEL DESIGN:
-- 1 job = 1 opening + 1 matchup + 1 mode
-- each job runs 2 games (colour swap)
-- each worker owns its own engines within that job
+- TT IS preserved across plies for the same side within a game.
+- For TokenBucket with probes, the SAME side engine is used for:
+    2k probe -> 5k probe -> actual selected search
+  so TT is shared across those stages.
 """
 
 import joblib
@@ -38,23 +36,26 @@ from typing import Dict, List, Optional, Tuple, Any
 from abc import ABC, abstractmethod
 from collections import Counter
 
-
 # =========================================================
 # Config
 # =========================================================
 
-STOCKFISH_PATH = r"stockfish"
-MODEL_PATH = "gbt_probe_tol20.joblib"
+STOCKFISH_PATH = "stockfish"
+MODEL_PATH = "trained_models/gbt_probe_tol20.joblib"
 OPENINGS_FILE = "openings_100.txt"
 RESULTS_DIR = "tournament_results_probe"
 
 TOTAL_NODE_BUDGET = 10_000_000
 BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
 
-PROBE_NODES = 5000
+SMALL_PROBE_NODES = 2_000
+LARGE_PROBE_NODES = 5_000
+
+# Initial estimate of remaining side-moves in a game
+INITIAL_MOVES_ESTIMATE = 64
 
 # Quick-run control
-NUM_OPENINGS = 5          # None = use all openings
+NUM_OPENINGS = 5   # None = use all openings
 
 # Debug
 DEBUG_CONTROLLER = True
@@ -74,7 +75,6 @@ THREADS = 1
 
 # Parallelism
 NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)
-
 
 # =========================================================
 # Engine helpers
@@ -98,86 +98,52 @@ def close_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
 
 
 # =========================================================
-# Piece values
+# Static feature extraction
 # =========================================================
 
-PIECE_VALUES = {
-    chess.PAWN: 1,
-    chess.KNIGHT: 3,
-    chess.BISHOP: 3,
-    chess.ROOK: 5,
-    chess.QUEEN: 9,
-}
+def extract_static_features(board: chess.Board) -> Dict[str, Any]:
+    feats: Dict[str, Any] = {}
 
-PIECE_NAMES = {
-    chess.PAWN: "pawn",
-    chess.KNIGHT: "knight",
-    chess.BISHOP: "bishop",
-    chess.ROOK: "rook",
-    chess.QUEEN: "queen",
-}
-
-
-# =========================================================
-# Feature extraction
-# =========================================================
-
-def extract_static_features(board: chess.Board) -> Dict[str, int]:
-    feats = {}
-    feats["num_legal_moves"] = board.legal_moves.count()
+    num_legal_moves = board.legal_moves.count()
+    feats["num_legal_moves"] = num_legal_moves
     feats["is_check"] = int(board.is_check())
-
-    for pt in [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
-        name = PIECE_NAMES[pt]
-        feats[f"white_{name}_count"] = len(board.pieces(pt, chess.WHITE))
-        feats[f"black_{name}_count"] = len(board.pieces(pt, chess.BLACK))
-
-    total_mat, mat_imbal = 0, 0
-    for pt, v in PIECE_VALUES.items():
-        w = len(board.pieces(pt, chess.WHITE))
-        b = len(board.pieces(pt, chess.BLACK))
-        total_mat += v * (w + b)
-        mat_imbal += v * (w - b)
-
-    feats["total_material"] = total_mat
-    feats["material_imbalance"] = mat_imbal
-    feats["total_pieces"] = sum(
-        1 for p in board.piece_map().values() if p.piece_type != chess.KING
-    )
     feats["side_to_move_white"] = int(board.turn == chess.WHITE)
-    feats["white_can_castle_kingside"] = int(board.has_kingside_castling_rights(chess.WHITE))
-    feats["white_can_castle_queenside"] = int(board.has_queenside_castling_rights(chess.WHITE))
-    feats["black_can_castle_kingside"] = int(board.has_kingside_castling_rights(chess.BLACK))
-    feats["black_can_castle_queenside"] = int(board.has_queenside_castling_rights(chess.BLACK))
-    feats["halfmove_clock"] = board.halfmove_clock
 
-    nc, nch, np = 0, 0, 0
+    num_captures = 0
+    num_checks = 0
+    num_promotions = 0
+
     for move in board.legal_moves:
         if board.is_capture(move):
-            nc += 1
-        if move.promotion:
-            np += 1
+            num_captures += 1
+        if move.promotion is not None:
+            num_promotions += 1
         if board.gives_check(move):
-            nch += 1
-    feats["num_captures"] = nc
-    feats["num_checks"] = nch
-    feats["num_promotions"] = np
+            num_checks += 1
 
-    for pt, fname in [
-        (chess.KNIGHT, "knight_mobility"),
-        (chess.BISHOP, "bishop_mobility"),
-        (chess.ROOK, "rook_mobility"),
-        (chess.QUEEN, "queen_mobility"),
-    ]:
-        t = 0
-        occ = board.occupied_co[board.turn]
-        for sq in board.pieces(pt, board.turn):
-            t += len(board.attacks(sq) & ~occ)
-        feats[fname] = t
+    denom = max(1, num_legal_moves)
+    feats["capture_ratio"] = num_captures / denom
+    feats["check_ratio"] = num_checks / denom
+    feats["num_promotions"] = num_promotions
 
-    enemy_king = board.king(not board.turn)
+    # Mobility of side to move
+    occupied_by_us = board.occupied_co[board.turn]
+    mobility_map = {
+        chess.KNIGHT: "knight_mobility",
+        chess.BISHOP: "bishop_mobility",
+        chess.ROOK: "rook_mobility",
+        chess.QUEEN: "queen_mobility",
+    }
+
+    for piece_type, feat_name in mobility_map.items():
+        total = 0
+        for sq in board.pieces(piece_type, board.turn):
+            total += len(board.attacks(sq) & ~occupied_by_us)
+        feats[feat_name] = total
+
+    enemy_king_sq = board.king(not board.turn)
     feats["num_attackers_on_king"] = (
-        len(board.attackers(board.turn, enemy_king)) if enemy_king else 0
+        len(board.attackers(board.turn, enemy_king_sq)) if enemy_king_sq is not None else 0
     )
 
     pin_count = 0
@@ -210,82 +176,120 @@ def extract_score_info(
     return "cp", cp if cp is not None else None
 
 
-def score_to_cp_for_gap(
+def score_to_cp(
     score_obj: Optional[chess.engine.PovScore]
 ) -> Optional[int]:
     if score_obj is None:
         return None
-
     white_score = score_obj.white()
     if white_score.is_mate():
         return None
-
     return white_score.score()
 
 
-def extract_probe_features(
-    engine: chess.engine.SimpleEngine,
-    board: chess.Board,
-    probe_nodes: int = PROBE_NODES,
-) -> Dict:
-    feats: Dict = {}
+def sign_of_cp(x: Optional[int]) -> int:
+    if x is None:
+        return 0
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
 
-    infos = engine.analyse(
-        board,
-        chess.engine.Limit(nodes=probe_nodes),
-        multipv=2
-    )
 
+def unpack_probe_infos(infos) -> Tuple[Dict, Dict]:
     if isinstance(infos, list):
         pv1 = infos[0] if len(infos) >= 1 else {}
         pv2 = infos[1] if len(infos) >= 2 else {}
     else:
         pv1 = infos
         pv2 = {}
+    return pv1, pv2
 
-    score_type, score_val = extract_score_info(pv1.get("score"))
-    feats["probe_score_type"] = score_type
-    feats["probe_score_cp"] = score_val if score_type == "cp" else None
-    feats["probe_abs_score_cp"] = abs(score_val) if score_type == "cp" and score_val is not None else None
-    feats["probe_is_mate"] = int(score_type == "mate")
-    feats["probe_mate_value"] = score_val if score_type == "mate" else None
 
-    feats["probe_depth"] = pv1.get("depth")
-    feats["probe_seldepth"] = pv1.get("seldepth")
+def extract_top_move_uci(pv_info: Dict) -> Optional[str]:
+    pv = pv_info.get("pv", [])
+    return pv[0].uci() if pv else None
 
-    cp1 = score_to_cp_for_gap(pv1.get("score"))
-    cp2 = score_to_cp_for_gap(pv2.get("score")) if pv2 else None
-    feats["probe_best_second_gap"] = (cp1 - cp2) if (cp1 is not None and cp2 is not None) else 0
 
-    feats["probe_nodes_requested"] = probe_nodes
-    feats["probe_nodes_reported"] = pv1.get("nodes")
+def best_second_gap_cp(pv1: Dict, pv2: Dict) -> int:
+    cp1 = score_to_cp(pv1.get("score"))
+    cp2 = score_to_cp(pv2.get("score")) if pv2 else None
+    if cp1 is not None and cp2 is not None:
+        return cp1 - cp2
+    return 0
+
+
+def extract_probe_features(
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    small_probe_nodes: int = SMALL_PROBE_NODES,
+    large_probe_nodes: int = LARGE_PROBE_NODES,
+) -> Dict[str, Any]:
+    """
+    Uses the SAME engine for:
+      2k probe -> 5k probe
+    so TT is shared across these probe stages, and then the actual search
+    in play_one_game() also uses the same engine.
+    """
+    feats: Dict[str, Any] = {}
+
+    # 2k probe first
+    infos_small = engine.analyse(
+        board,
+        chess.engine.Limit(nodes=small_probe_nodes),
+        multipv=2
+    )
+
+    # 5k probe second on SAME engine
+    infos_large = engine.analyse(
+        board,
+        chess.engine.Limit(nodes=large_probe_nodes),
+        multipv=2
+    )
+
+    small_pv1, small_pv2 = unpack_probe_infos(infos_small)
+    large_pv1, large_pv2 = unpack_probe_infos(infos_large)
+
+    # Keep
+    large_score_type, large_score_val = extract_score_info(large_pv1.get("score"))
+    feats["probe_score_cp"] = large_score_val if large_score_type == "cp" else None
+    feats["probe_abs_score_cp"] = abs(large_score_val) if large_score_type == "cp" and large_score_val is not None else None
+    feats["probe_is_mate"] = int(large_score_type == "mate")
+    feats["probe_depth"] = large_pv1.get("depth")
+    feats["probe_seldepth"] = large_pv1.get("seldepth")
+    feats["probe_best_second_gap"] = best_second_gap_cp(large_pv1, large_pv2)
+
+    # Add
+    small_cp = score_to_cp(small_pv1.get("score"))
+    large_cp = score_to_cp(large_pv1.get("score"))
+
+    small_gap = best_second_gap_cp(small_pv1, small_pv2)
+    large_gap = feats["probe_best_second_gap"]
+
+    small_top_move = extract_top_move_uci(small_pv1)
+    large_top_move = extract_top_move_uci(large_pv1)
+
+    feats["probe_score_delta_small"] = abs(large_cp - small_cp) if small_cp is not None and large_cp is not None else 0
+    feats["probe_gap_delta_small"] = abs(large_gap - small_gap)
+    feats["probe_sign_flip"] = int(sign_of_cp(small_cp) != sign_of_cp(large_cp))
+    feats["probe_top_move_changed"] = int(
+        small_top_move is not None and large_top_move is not None and small_top_move != large_top_move
+    )
 
     return feats
 
 
 # =========================================================
-# Moves-left estimator
+# Moves-left estimate
 # =========================================================
 
-def get_total_material(board: chess.Board) -> int:
-    x = 0
-    for pt, v in PIECE_VALUES.items():
-        x += v * len(board.pieces(pt, chess.WHITE))
-        x += v * len(board.pieces(pt, chess.BLACK))
-    return x
-
-
-def estimate_moves_left(board: chess.Board) -> int:
-    x = get_total_material(board)
-
-    if x < 20:
-        y = x + 10
-    elif x <= 60:
-        y = (3 / 8) * x + 22
-    else:
-        y = (5 / 4) * x - 30
-
-    return max(1, int(y / 2))
+def estimate_moves_left(board: chess.Board, ply: int) -> int:
+    """
+    Simple decreasing side-move estimate starting from INITIAL_MOVES_ESTIMATE.
+    """
+    side_moves_played = ply // 2
+    return max(1, INITIAL_MOVES_ESTIMATE - side_moves_played)
 
 
 # =========================================================
@@ -317,7 +321,7 @@ class AllocationPolicy(ABC):
         board: chess.Board,
         ply: int
     ) -> int:
-        pass
+        raise NotImplementedError
 
     def consume(self, nodes_used: int):
         self.remaining_budget = max(0, self.remaining_budget - nodes_used)
@@ -336,7 +340,7 @@ class AllocationPolicy(ABC):
 class FixedUniformPolicy(AllocationPolicy):
     def __init__(self, total_budget: int, use_discrete: bool):
         super().__init__("FixedUniform", total_budget, use_discrete)
-        self.fixed_allocation = total_budget / 50
+        self.fixed_allocation = total_budget / INITIAL_MOVES_ESTIMATE
 
     def decide_nodes(self, engine, board, ply) -> int:
         raw = min(self.fixed_allocation, self.remaining_budget)
@@ -348,7 +352,7 @@ class SolakVuckovicPolicy(AllocationPolicy):
         super().__init__("SolakVuckovic", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board)
+        moves_left = estimate_moves_left(board, ply)
         raw = self.remaining_budget / moves_left
         return self.finalise(raw)
 
@@ -358,11 +362,13 @@ class HyattPolicy(AllocationPolicy):
         super().__init__("Hyatt", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board)
+        moves_left = estimate_moves_left(board, ply)
         target = self.remaining_budget / moves_left
+
         side_moves_played = ply // 2
         n = min(side_moves_played, 10)
         factor = 2.0 - n / 10.0
+
         raw = factor * target
         return self.finalise(raw)
 
@@ -381,11 +387,12 @@ class TokenBucketPolicy(AllocationPolicy):
         payload = joblib.load(model_path)
         self.model = payload["model"]
         self.feature_cols = payload["feature_cols"]
+
         self.uses_probe = any(col.startswith("probe_") for col in self.feature_cols)
 
         self.burst_cap = burst_cap
         self.tokens = float(burst_cap)
-        self.refill_rate = total_budget / 50
+        self.refill_rate = total_budget / INITIAL_MOVES_ESTIMATE
 
         self.debug_source_tag = "unset"
         self.debug_rows = debug_rows if debug_rows is not None else []
@@ -393,7 +400,7 @@ class TokenBucketPolicy(AllocationPolicy):
     def reset(self):
         super().reset()
         self.tokens = float(self.burst_cap)
-        self.refill_rate = self.total_budget / 50
+        self.refill_rate = self.total_budget / INITIAL_MOVES_ESTIMATE
 
     def set_debug_source_tag(self, tag: str):
         self.debug_source_tag = tag
@@ -410,11 +417,11 @@ class TokenBucketPolicy(AllocationPolicy):
         feats = extract_static_features(board)
 
         if self.uses_probe:
-            probe_feats = extract_probe_features(engine, board, probe_nodes=PROBE_NODES)
+            probe_feats = extract_probe_features(engine, board)
             feats.update(probe_feats)
 
-        row = {}
-        raw_view = {}
+        row: Dict[str, Any] = {}
+        raw_view: Dict[str, Any] = {}
 
         for col in self.feature_cols:
             original_val = feats.get(col, 0)
@@ -432,7 +439,7 @@ class TokenBucketPolicy(AllocationPolicy):
         return X, row, raw_view
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board)
+        moves_left = estimate_moves_left(board, ply)
         self.refill_rate = self.remaining_budget / moves_left
 
         X, sanitized_row, raw_view = self.build_feature_payload(engine, board)
@@ -442,13 +449,28 @@ class TokenBucketPolicy(AllocationPolicy):
         final_nodes = self.finalise(spendable)
 
         interesting_cols = [
-            "num_legal_moves", "is_check", "total_material", "material_imbalance",
-            "total_pieces", "halfmove_clock", "num_captures", "num_checks",
-            "num_promotions", "knight_mobility", "bishop_mobility", "rook_mobility",
-            "queen_mobility", "num_attackers_on_king", "num_pinned_pieces",
-            "probe_score_cp", "probe_abs_score_cp", "probe_is_mate",
-            "probe_mate_value", "probe_depth", "probe_seldepth",
-            "probe_best_second_gap", "probe_nodes_requested", "probe_nodes_reported",
+            "num_legal_moves",
+            "is_check",
+            "capture_ratio",
+            "check_ratio",
+            "num_promotions",
+            "knight_mobility",
+            "bishop_mobility",
+            "rook_mobility",
+            "queen_mobility",
+            "num_attackers_on_king",
+            "num_pinned_pieces",
+            "side_to_move_white",
+            "probe_score_cp",
+            "probe_abs_score_cp",
+            "probe_best_second_gap",
+            "probe_depth",
+            "probe_seldepth",
+            "probe_is_mate",
+            "probe_score_delta_small",
+            "probe_gap_delta_small",
+            "probe_sign_flip",
+            "probe_top_move_changed",
         ]
 
         feature_snapshot = {k: raw_view[k] for k in interesting_cols if k in raw_view}
@@ -512,7 +534,6 @@ MATCHUP_REGISTRY = {
     "TokenBucket_vs_SolakVuckovic": ("TokenBucket", "SolakVuckovic"),
     "TokenBucket_vs_Hyatt": ("TokenBucket", "Hyatt"),
 }
-
 
 # =========================================================
 # Policy factory
@@ -862,6 +883,7 @@ def main():
     print(f"NUM_OPENINGS={NUM_OPENINGS}")
     print(f"NUM_WORKERS={NUM_WORKERS}")
     print(f"DEBUG_CONTROLLER={DEBUG_CONTROLLER}")
+    print(f"INITIAL_MOVES_ESTIMATE={INITIAL_MOVES_ESTIMATE}")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
