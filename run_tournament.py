@@ -1,6 +1,7 @@
 """
 run_tournament.py
 =================
+
 Parallel tournament runner with per-side TT isolation.
 
 Policies tested:
@@ -13,20 +14,14 @@ Supports:
   - static-only models
   - probe models
 
-IMPORTANT TT DESIGN:
-- Each side gets its own Stockfish engine instance per game.
-- White and Black do NOT share a transposition table.
-- Engines are restarted between games, so TT does NOT carry across games/matchups.
-- TT IS preserved across plies for the same side within a game.
-- For TokenBucket with probes, the SAME side engine is used for:
-    2k probe -> 5k probe -> actual selected search
-  so TT is shared across those stages.
+IMPORTANT TT DESIGN
+-------------------
+1) Each side gets its own Stockfish engine instance per game.
+2) White and Black do NOT share a TT.
+3) Engines are restarted between games, so TT does NOT carry across games/matchups.
+4)For TokenBucket with probe features, TT persists across 2k, 5k and actual search.
 """
 
-import joblib
-import chess
-import chess.engine
-import pandas as pd
 import csv
 import os
 import time
@@ -35,6 +30,12 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple, Any
 from abc import ABC, abstractmethod
 from collections import Counter
+
+import chess
+import chess.engine
+import joblib
+import pandas as pd
+
 
 # =========================================================
 # Config
@@ -55,7 +56,7 @@ LARGE_PROBE_NODES = 5_000
 INITIAL_MOVES_ESTIMATE = 64
 
 # Quick-run control
-NUM_OPENINGS = 5   # None = use all openings
+NUM_OPENINGS = 5          # None = use all openings
 
 # Debug
 DEBUG_CONTROLLER = True
@@ -73,8 +74,9 @@ RESIGN_CONSECUTIVE = 5
 HASH_MB = 128
 THREADS = 1
 
-# Parallelism
-NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+# Assuming 16 vCPUs like I am using in Hetzner
+NUM_WORKERS = 8
+
 
 # =========================================================
 # Engine helpers
@@ -126,8 +128,8 @@ def extract_static_features(board: chess.Board) -> Dict[str, Any]:
     feats["check_ratio"] = num_checks / denom
     feats["num_promotions"] = num_promotions
 
-    # Mobility of side to move
     occupied_by_us = board.occupied_co[board.turn]
+
     mobility_map = {
         chess.KNIGHT: "knight_mobility",
         chess.BISHOP: "bishop_mobility",
@@ -229,19 +231,17 @@ def extract_probe_features(
     """
     Uses the SAME engine for:
       2k probe -> 5k probe
-    so TT is shared across these probe stages, and then the actual search
-    in play_one_game() also uses the same engine.
+    so TT is shared across those probe stages, and then the actual search
+    also uses the same engine in play_one_game().
     """
     feats: Dict[str, Any] = {}
 
-    # 2k probe first
     infos_small = engine.analyse(
         board,
         chess.engine.Limit(nodes=small_probe_nodes),
         multipv=2
     )
 
-    # 5k probe second on SAME engine
     infos_large = engine.analyse(
         board,
         chess.engine.Limit(nodes=large_probe_nodes),
@@ -284,7 +284,7 @@ def extract_probe_features(
 # Moves-left estimate
 # =========================================================
 
-def estimate_moves_left(board: chess.Board, ply: int) -> int:
+def estimate_moves_left(ply: int) -> int:
     """
     Simple decreasing side-move estimate starting from INITIAL_MOVES_ESTIMATE.
     """
@@ -352,7 +352,7 @@ class SolakVuckovicPolicy(AllocationPolicy):
         super().__init__("SolakVuckovic", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board, ply)
+        moves_left = estimate_moves_left(ply)
         raw = self.remaining_budget / moves_left
         return self.finalise(raw)
 
@@ -362,7 +362,7 @@ class HyattPolicy(AllocationPolicy):
         super().__init__("Hyatt", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board, ply)
+        moves_left = estimate_moves_left(ply)
         target = self.remaining_budget / moves_left
 
         side_moves_played = ply // 2
@@ -387,7 +387,6 @@ class TokenBucketPolicy(AllocationPolicy):
         payload = joblib.load(model_path)
         self.model = payload["model"]
         self.feature_cols = payload["feature_cols"]
-
         self.uses_probe = any(col.startswith("probe_") for col in self.feature_cols)
 
         self.burst_cap = burst_cap
@@ -417,8 +416,7 @@ class TokenBucketPolicy(AllocationPolicy):
         feats = extract_static_features(board)
 
         if self.uses_probe:
-            probe_feats = extract_probe_features(engine, board)
-            feats.update(probe_feats)
+            feats.update(extract_probe_features(engine, board))
 
         row: Dict[str, Any] = {}
         raw_view: Dict[str, Any] = {}
@@ -439,7 +437,7 @@ class TokenBucketPolicy(AllocationPolicy):
         return X, row, raw_view
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(board, ply)
+        moves_left = estimate_moves_left(ply)
         self.refill_rate = self.remaining_budget / moves_left
 
         X, sanitized_row, raw_view = self.build_feature_payload(engine, board)
@@ -534,6 +532,7 @@ MATCHUP_REGISTRY = {
     "TokenBucket_vs_SolakVuckovic": ("TokenBucket", "SolakVuckovic"),
     "TokenBucket_vs_Hyatt": ("TokenBucket", "Hyatt"),
 }
+
 
 # =========================================================
 # Policy factory
@@ -708,35 +707,43 @@ def run_job(job: MatchJob) -> Tuple[MatchJob, List[GameResult], List[Dict[str, A
 
     a_name, b_name = MATCHUP_REGISTRY[job.matchup_name]
 
-    # Game 1: A as White
-    white_engine = None
-    black_engine = None
     try:
-        white_engine = open_engine()
-        black_engine = open_engine()
+        # Game 1: A as White
+        white_engine = None
+        black_engine = None
+        try:
+            white_engine = open_engine()
+            black_engine = open_engine()
 
-        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
-        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
-        g1 = play_one_game(white_engine, black_engine, job.opening_fen, a, b, job.opening_idx)
-        results.append(g1)
-    finally:
-        close_engine(white_engine)
-        close_engine(black_engine)
+            a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+            b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+            g1 = play_one_game(white_engine, black_engine, job.opening_fen, a, b, job.opening_idx)
+            results.append(g1)
+        finally:
+            close_engine(white_engine)
+            close_engine(black_engine)
 
-    # Game 2: B as White
-    white_engine = None
-    black_engine = None
-    try:
-        white_engine = open_engine()
-        black_engine = open_engine()
+        # Game 2: B as White
+        white_engine = None
+        black_engine = None
+        try:
+            white_engine = open_engine()
+            black_engine = open_engine()
 
-        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
-        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
-        g2 = play_one_game(white_engine, black_engine, job.opening_fen, b, a, job.opening_idx)
-        results.append(g2)
-    finally:
-        close_engine(white_engine)
-        close_engine(black_engine)
+            a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+            b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+            g2 = play_one_game(white_engine, black_engine, job.opening_fen, b, a, job.opening_idx)
+            results.append(g2)
+        finally:
+            close_engine(white_engine)
+            close_engine(black_engine)
+
+    except Exception as e:
+        print(
+            f"[worker-error] opening={job.opening_idx} matchup={job.matchup_name} "
+            f"mode={'discrete' if job.use_discrete else 'continuous'} error={e}",
+            flush=True,
+        )
 
     return job, results, debug_rows
 
@@ -939,4 +946,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # On Linux/Hetzner, default start method is usually fine.
     main()
