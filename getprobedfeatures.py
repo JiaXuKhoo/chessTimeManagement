@@ -10,7 +10,7 @@ import chess.engine
 # Config
 # =========================================================
 
-STOCKFISH_PATH = "stockfish"
+STOCKFISH_PATH = r"C:\Users\khoo\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
 INPUT_CSV = "dataset_static_tol20.csv"
 OUTPUT_CSV = "dataset_probe_tol20.csv"
 

@@ -42,7 +42,7 @@ import pandas as pd
 # =========================================================
 
 STOCKFISH_PATH = "stockfish"
-MODEL_PATH = "trained_models/gbt_probe_tol20.joblib"
+MODEL_PATH = "gbt_probe_tol20.joblib"
 OPENINGS_FILE = "openings_100.txt"
 RESULTS_DIR = "tournament_results_probe"
 
@@ -56,10 +56,10 @@ LARGE_PROBE_NODES = 5_000
 INITIAL_MOVES_ESTIMATE = 64
 
 # Quick-run control
-NUM_OPENINGS = 5          # None = use all openings
+NUM_OPENINGS = None
 
 # Debug
-DEBUG_CONTROLLER = True
+DEBUG_CONTROLLER = False
 DEBUG_MAX_RECORDS_PER_JOB = 50
 DEBUG_PRINT_FIRST_N = 12
 
