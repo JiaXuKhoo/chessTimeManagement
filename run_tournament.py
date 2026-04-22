@@ -2,7 +2,8 @@
 run_tournament.py
 =================
 
-Parallel tournament runner with per-side TT isolation.
+Parallel tournament runner with per-side TT isolation and lightweight
+per-game telemetry for report writing.
 
 Policies tested:
   1. FixedUniform
@@ -19,7 +20,16 @@ IMPORTANT TT DESIGN
 1) Each side gets its own Stockfish engine instance per game.
 2) White and Black do NOT share a TT.
 3) Engines are restarted between games, so TT does NOT carry across games/matchups.
-4)For TokenBucket with probe features, TT persists across 2k, 5k and actual search.
+4) For TokenBucket with probe features, TT persists across 2k, 5k and actual search.
+
+NEW TELEMETRY
+-------------
+Per game, we log compact aggregate information that is useful for the report:
+- how many times each bucket was REQUESTED by TokenBucket
+- how many times each bucket BAND was actually spent
+- how many moves were token-limited
+- how many moves were remaining-budget-limited
+- how many moves were constrained by either
 """
 
 import csv
@@ -52,18 +62,14 @@ BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
 SMALL_PROBE_NODES = 2_000
 LARGE_PROBE_NODES = 5_000
 
-# Initial estimate of remaining side-moves in a game
 INITIAL_MOVES_ESTIMATE = 64
 
-# Quick-run control
 NUM_OPENINGS = None
 
-# Debug
 DEBUG_CONTROLLER = False
 DEBUG_MAX_RECORDS_PER_JOB = 50
 DEBUG_PRINT_FIRST_N = 12
 
-# Adjudication
 MAX_PLIES = 400
 DRAW_MOVE_THRESHOLD = 40
 DRAW_CP_THRESHOLD = 5
@@ -74,7 +80,7 @@ RESIGN_CONSECUTIVE = 5
 HASH_MB = 128
 THREADS = 1
 
-# Assuming 16 vCPUs like I am using in Hetzner
+# 16 vCPUs -> start with 8 workers, since each worker may have 2 active engines
 NUM_WORKERS = 8
 
 
@@ -97,6 +103,37 @@ def close_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
             engine.quit()
         except Exception:
             pass
+
+
+# =========================================================
+# Bucket helpers
+# =========================================================
+
+def snap_to_bucket(nodes: float) -> int:
+    affordable = [b for b in BUCKETS if b <= nodes]
+    if affordable:
+        return max(affordable)
+    return min(int(nodes), BUCKETS[0])
+
+
+def bucket_band(nodes: int) -> int:
+    """
+    Map any positive node count into one of the 4 report-friendly bands.
+    Examples:
+      10k   -> 25k band
+      70k   -> 100k band
+      300k  -> 400k band
+      900k  -> 1.6M band
+      2.0M  -> 1.6M band
+    """
+    for b in BUCKETS:
+        if nodes <= b:
+            return b
+    return BUCKETS[-1]
+
+
+def zero_bucket_counter() -> Counter:
+    return Counter({b: 0 for b in BUCKETS})
 
 
 # =========================================================
@@ -231,8 +268,7 @@ def extract_probe_features(
     """
     Uses the SAME engine for:
       2k probe -> 5k probe
-    so TT is shared across those probe stages, and then the actual search
-    also uses the same engine in play_one_game().
+    so TT is shared across probe stages and the later actual search.
     """
     feats: Dict[str, Any] = {}
 
@@ -251,7 +287,6 @@ def extract_probe_features(
     small_pv1, small_pv2 = unpack_probe_infos(infos_small)
     large_pv1, large_pv2 = unpack_probe_infos(infos_large)
 
-    # Keep
     large_score_type, large_score_val = extract_score_info(large_pv1.get("score"))
     feats["probe_score_cp"] = large_score_val if large_score_type == "cp" else None
     feats["probe_abs_score_cp"] = abs(large_score_val) if large_score_type == "cp" and large_score_val is not None else None
@@ -260,7 +295,6 @@ def extract_probe_features(
     feats["probe_seldepth"] = large_pv1.get("seldepth")
     feats["probe_best_second_gap"] = best_second_gap_cp(large_pv1, large_pv2)
 
-    # Add
     small_cp = score_to_cp(small_pv1.get("score"))
     large_cp = score_to_cp(large_pv1.get("score"))
 
@@ -285,22 +319,8 @@ def extract_probe_features(
 # =========================================================
 
 def estimate_moves_left(ply: int) -> int:
-    """
-    Simple decreasing side-move estimate starting from INITIAL_MOVES_ESTIMATE.
-    """
     side_moves_played = ply // 2
     return max(1, INITIAL_MOVES_ESTIMATE - side_moves_played)
-
-
-# =========================================================
-# Bucket helper
-# =========================================================
-
-def snap_to_bucket(nodes: float) -> int:
-    affordable = [b for b in BUCKETS if b <= nodes]
-    if affordable:
-        return max(affordable)
-    return min(int(nodes), BUCKETS[0])
 
 
 # =========================================================
@@ -313,6 +333,9 @@ class AllocationPolicy(ABC):
         self.total_budget = total_budget
         self.remaining_budget = total_budget
         self.use_discrete = use_discrete
+
+        self.moves_allocated = 0
+        self.final_bucket_counts = zero_bucket_counter()
 
     @abstractmethod
     def decide_nodes(
@@ -333,8 +356,32 @@ class AllocationPolicy(ABC):
             return snap_to_bucket(raw)
         return max(1, int(raw))
 
+    def record_allocation(self, chosen_nodes: int):
+        self.moves_allocated += 1
+        self.final_bucket_counts[bucket_band(chosen_nodes)] += 1
+
+    def export_game_metrics(self, prefix: str) -> Dict[str, Any]:
+        out = {
+            f"{prefix}_moves_allocated": self.moves_allocated,
+        }
+        for b in BUCKETS:
+            out[f"{prefix}_final_bucket_{b}_count"] = int(self.final_bucket_counts[b])
+
+        # Default zeros for non-TokenBucket policies
+        out[f"{prefix}_requested_bucket_25000_count"] = 0
+        out[f"{prefix}_requested_bucket_100000_count"] = 0
+        out[f"{prefix}_requested_bucket_400000_count"] = 0
+        out[f"{prefix}_requested_bucket_1600000_count"] = 0
+        out[f"{prefix}_token_limited_moves"] = 0
+        out[f"{prefix}_budget_limited_moves"] = 0
+        out[f"{prefix}_constrained_moves"] = 0
+
+        return out
+
     def reset(self):
         self.remaining_budget = self.total_budget
+        self.moves_allocated = 0
+        self.final_bucket_counts = zero_bucket_counter()
 
 
 class FixedUniformPolicy(AllocationPolicy):
@@ -396,10 +443,20 @@ class TokenBucketPolicy(AllocationPolicy):
         self.debug_source_tag = "unset"
         self.debug_rows = debug_rows if debug_rows is not None else []
 
+        self.requested_bucket_counts = zero_bucket_counter()
+        self.token_limited_moves = 0
+        self.budget_limited_moves = 0
+        self.constrained_moves = 0
+
     def reset(self):
         super().reset()
         self.tokens = float(self.burst_cap)
         self.refill_rate = self.total_budget / INITIAL_MOVES_ESTIMATE
+
+        self.requested_bucket_counts = zero_bucket_counter()
+        self.token_limited_moves = 0
+        self.budget_limited_moves = 0
+        self.constrained_moves = 0
 
     def set_debug_source_tag(self, tag: str):
         self.debug_source_tag = tag
@@ -443,6 +500,19 @@ class TokenBucketPolicy(AllocationPolicy):
         X, sanitized_row, raw_view = self.build_feature_payload(engine, board)
         predicted = int(self.model.predict(X)[0])
 
+        requested_bucket = predicted if predicted in BUCKETS else bucket_band(max(1, predicted))
+        self.requested_bucket_counts[requested_bucket] += 1
+
+        token_limited = predicted > self.tokens
+        budget_limited = predicted > self.remaining_budget
+
+        if token_limited:
+            self.token_limited_moves += 1
+        if budget_limited:
+            self.budget_limited_moves += 1
+        if token_limited or budget_limited:
+            self.constrained_moves += 1
+
         spendable = min(predicted, self.tokens, self.remaining_budget)
         final_nodes = self.finalise(spendable)
 
@@ -485,6 +555,9 @@ class TokenBucketPolicy(AllocationPolicy):
             "remaining_budget_before": self.remaining_budget,
             "tokens_before": self.tokens,
             "predicted_raw": predicted,
+            "requested_bucket": requested_bucket,
+            "token_limited": int(token_limited),
+            "budget_limited": int(budget_limited),
             "spendable_before_finalise": spendable,
             "final_nodes": final_nodes,
             "feature_snapshot_raw": feature_snapshot,
@@ -497,6 +570,20 @@ class TokenBucketPolicy(AllocationPolicy):
         super().consume(nodes_used)
         self.tokens = max(0.0, self.tokens - nodes_used)
         self.tokens = min(self.tokens + self.refill_rate, float(self.burst_cap))
+
+    def export_game_metrics(self, prefix: str) -> Dict[str, Any]:
+        out = super().export_game_metrics(prefix)
+
+        out[f"{prefix}_requested_bucket_25000_count"] = int(self.requested_bucket_counts[25_000])
+        out[f"{prefix}_requested_bucket_100000_count"] = int(self.requested_bucket_counts[100_000])
+        out[f"{prefix}_requested_bucket_400000_count"] = int(self.requested_bucket_counts[400_000])
+        out[f"{prefix}_requested_bucket_1600000_count"] = int(self.requested_bucket_counts[1_600_000])
+
+        out[f"{prefix}_token_limited_moves"] = int(self.token_limited_moves)
+        out[f"{prefix}_budget_limited_moves"] = int(self.budget_limited_moves)
+        out[f"{prefix}_constrained_moves"] = int(self.constrained_moves)
+
+        return out
 
 
 # =========================================================
@@ -518,6 +605,37 @@ class GameResult:
     white_nodes_total: int
     black_nodes_total: int
 
+    white_moves_allocated: int
+    black_moves_allocated: int
+
+    white_final_bucket_25000_count: int
+    white_final_bucket_100000_count: int
+    white_final_bucket_400000_count: int
+    white_final_bucket_1600000_count: int
+
+    black_final_bucket_25000_count: int
+    black_final_bucket_100000_count: int
+    black_final_bucket_400000_count: int
+    black_final_bucket_1600000_count: int
+
+    white_requested_bucket_25000_count: int
+    white_requested_bucket_100000_count: int
+    white_requested_bucket_400000_count: int
+    white_requested_bucket_1600000_count: int
+
+    black_requested_bucket_25000_count: int
+    black_requested_bucket_100000_count: int
+    black_requested_bucket_400000_count: int
+    black_requested_bucket_1600000_count: int
+
+    white_token_limited_moves: int
+    white_budget_limited_moves: int
+    white_constrained_moves: int
+
+    black_token_limited_moves: int
+    black_budget_limited_moves: int
+    black_constrained_moves: int
+
 
 @dataclass
 class MatchJob:
@@ -532,6 +650,8 @@ MATCHUP_REGISTRY = {
     "TokenBucket_vs_SolakVuckovic": ("TokenBucket", "SolakVuckovic"),
     "TokenBucket_vs_Hyatt": ("TokenBucket", "Hyatt"),
 }
+
+GAME_RESULT_FIELDS = list(GameResult.__dataclass_fields__.keys())
 
 
 # =========================================================
@@ -599,6 +719,7 @@ def play_one_game(
 
         nodes = policy.decide_nodes(engine, board, ply)
         nodes = max(1, min(nodes, policy.remaining_budget))
+        policy.record_allocation(nodes)
 
         info = engine.analyse(board, chess.engine.Limit(nodes=nodes))
         pv = info.get("pv", [])
@@ -681,20 +802,25 @@ def play_one_game(
     else:
         result = "*"
 
-    return GameResult(
-        opening_idx=opening_idx,
-        opening_fen=opening_fen,
-        white_policy=white_policy.name,
-        black_policy=black_policy.name,
-        discrete=white_policy.use_discrete,
-        result=result,
-        termination=termination,
-        total_plies=ply,
-        white_budget_remaining=white_policy.remaining_budget,
-        black_budget_remaining=black_policy.remaining_budget,
-        white_nodes_total=w_nodes,
-        black_nodes_total=b_nodes,
-    )
+    row = {
+        "opening_idx": opening_idx,
+        "opening_fen": opening_fen,
+        "white_policy": white_policy.name,
+        "black_policy": black_policy.name,
+        "discrete": white_policy.use_discrete,
+        "result": result,
+        "termination": termination,
+        "total_plies": ply,
+        "white_budget_remaining": white_policy.remaining_budget,
+        "black_budget_remaining": black_policy.remaining_budget,
+        "white_nodes_total": w_nodes,
+        "black_nodes_total": b_nodes,
+    }
+
+    row.update(white_policy.export_game_metrics("white"))
+    row.update(black_policy.export_game_metrics("black"))
+
+    return GameResult(**row)
 
 
 # =========================================================
@@ -707,43 +833,35 @@ def run_job(job: MatchJob) -> Tuple[MatchJob, List[GameResult], List[Dict[str, A
 
     a_name, b_name = MATCHUP_REGISTRY[job.matchup_name]
 
+    # Game 1: A as White
+    white_engine = None
+    black_engine = None
     try:
-        # Game 1: A as White
-        white_engine = None
-        black_engine = None
-        try:
-            white_engine = open_engine()
-            black_engine = open_engine()
+        white_engine = open_engine()
+        black_engine = open_engine()
 
-            a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
-            b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
-            g1 = play_one_game(white_engine, black_engine, job.opening_fen, a, b, job.opening_idx)
-            results.append(g1)
-        finally:
-            close_engine(white_engine)
-            close_engine(black_engine)
+        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+        g1 = play_one_game(white_engine, black_engine, job.opening_fen, a, b, job.opening_idx)
+        results.append(g1)
+    finally:
+        close_engine(white_engine)
+        close_engine(black_engine)
 
-        # Game 2: B as White
-        white_engine = None
-        black_engine = None
-        try:
-            white_engine = open_engine()
-            black_engine = open_engine()
+    # Game 2: B as White
+    white_engine = None
+    black_engine = None
+    try:
+        white_engine = open_engine()
+        black_engine = open_engine()
 
-            a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
-            b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
-            g2 = play_one_game(white_engine, black_engine, job.opening_fen, b, a, job.opening_idx)
-            results.append(g2)
-        finally:
-            close_engine(white_engine)
-            close_engine(black_engine)
-
-    except Exception as e:
-        print(
-            f"[worker-error] opening={job.opening_idx} matchup={job.matchup_name} "
-            f"mode={'discrete' if job.use_discrete else 'continuous'} error={e}",
-            flush=True,
-        )
+        a = make_policy(a_name, job.use_discrete, debug_rows=debug_rows)
+        b = make_policy(b_name, job.use_discrete, debug_rows=debug_rows)
+        g2 = play_one_game(white_engine, black_engine, job.opening_fen, b, a, job.opening_idx)
+        results.append(g2)
+    finally:
+        close_engine(white_engine)
+        close_engine(black_engine)
 
     return job, results, debug_rows
 
@@ -777,15 +895,41 @@ def summarise(results: List[GameResult], a_name: str):
     print(f"  Terminations: {terms}")
 
 
+def summarise_tokenbucket_logs(results: List[GameResult], a_name: str):
+    if a_name != "TokenBucket":
+        return
+
+    req = zero_bucket_counter()
+    finals = zero_bucket_counter()
+    token_limited = 0
+    budget_limited = 0
+    constrained = 0
+
+    for r in results:
+        req[25_000] += r.white_requested_bucket_25000_count + r.black_requested_bucket_25000_count
+        req[100_000] += r.white_requested_bucket_100000_count + r.black_requested_bucket_100000_count
+        req[400_000] += r.white_requested_bucket_400000_count + r.black_requested_bucket_400000_count
+        req[1_600_000] += r.white_requested_bucket_1600000_count + r.black_requested_bucket_1600000_count
+
+        finals[25_000] += r.white_final_bucket_25000_count + r.black_final_bucket_25000_count
+        finals[100_000] += r.white_final_bucket_100000_count + r.black_final_bucket_100000_count
+        finals[400_000] += r.white_final_bucket_400000_count + r.black_final_bucket_400000_count
+        finals[1_600_000] += r.white_final_bucket_1600000_count + r.black_final_bucket_1600000_count
+
+        token_limited += r.white_token_limited_moves + r.black_token_limited_moves
+        budget_limited += r.white_budget_limited_moves + r.black_budget_limited_moves
+        constrained += r.white_constrained_moves + r.black_constrained_moves
+
+    print("  TokenBucket requested buckets:", dict(req))
+    print("  Actual final bucket bands    :", dict(finals))
+    print(f"  Token-limited moves          : {token_limited}")
+    print(f"  Budget-limited moves         : {budget_limited}")
+    print(f"  Constrained moves            : {constrained}")
+
+
 def save_csv(results: List[GameResult], path: str):
-    fields = [
-        "opening_idx", "opening_fen", "white_policy", "black_policy",
-        "discrete", "result", "termination", "total_plies",
-        "white_budget_remaining", "black_budget_remaining",
-        "white_nodes_total", "black_nodes_total",
-    ]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=GAME_RESULT_FIELDS)
         w.writeheader()
         for r in results:
             w.writerow(asdict(r))
@@ -808,30 +952,19 @@ def print_debug_summary(debug_rows: List[Dict[str, Any]]):
 
     predicted_counter = Counter(row["predicted_raw"] for row in debug_rows)
     final_counter = Counter(row["final_nodes"] for row in debug_rows)
+    requested_counter = Counter(row.get("requested_bucket", 0) for row in debug_rows)
 
     print("\nPredicted raw values frequency:")
     for k, v in predicted_counter.most_common():
         print(f"  {k}: {v}")
 
+    print("\nRequested bucket frequency:")
+    for k, v in requested_counter.most_common():
+        print(f"  {k}: {v}")
+
     print("\nFinal allocated nodes frequency:")
     for k, v in final_counter.most_common():
         print(f"  {k}: {v}")
-
-    avg_pred = sum(row["predicted_raw"] for row in debug_rows) / len(debug_rows)
-    avg_final = sum(row["final_nodes"] for row in debug_rows) / len(debug_rows)
-    avg_spendable = sum(row["spendable_before_finalise"] for row in debug_rows) / len(debug_rows)
-
-    print(f"\nAverage predicted_raw: {avg_pred:.2f}")
-    print(f"Average spendable_before_finalise: {avg_spendable:.2f}")
-    print(f"Average final_nodes: {avg_final:.2f}")
-
-    unexpected_preds = [
-        row["predicted_raw"] for row in debug_rows
-        if row["use_discrete"] and row["predicted_raw"] not in BUCKETS
-    ]
-    if unexpected_preds:
-        print("\nWARNING: In discrete mode, some raw predictions are not one of the bucket values.")
-        print(f"Example unexpected predictions: {unexpected_preds[:10]}")
 
     print(f"\nFirst {min(DEBUG_PRINT_FIRST_N, len(debug_rows))} debug rows:")
     for i, row in enumerate(debug_rows[:DEBUG_PRINT_FIRST_N], start=1):
@@ -845,6 +978,9 @@ def print_debug_summary(debug_rows: List[Dict[str, Any]]):
         print(f"remaining_budget_before   : {row['remaining_budget_before']}")
         print(f"tokens_before             : {row['tokens_before']:.2f}")
         print(f"predicted_raw             : {row['predicted_raw']}")
+        print(f"requested_bucket          : {row['requested_bucket']}")
+        print(f"token_limited             : {row['token_limited']}")
+        print(f"budget_limited            : {row['budget_limited']}")
         print(f"spendable_before_finalise : {row['spendable_before_finalise']}")
         print(f"final_nodes               : {row['final_nodes']}")
         print(f"feature_snapshot_raw      : {row['feature_snapshot_raw']}")
@@ -933,6 +1069,7 @@ def main():
             print(f"{matchup_name} ({mode}) — {len(results)} games")
             print(f"{'='*60}")
             summarise(results, a_name)
+            summarise_tokenbucket_logs(results, a_name)
 
             csv_path = os.path.join(RESULTS_DIR, f"{matchup_name}_{mode}.csv")
             save_csv(results, csv_path)
@@ -946,5 +1083,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # On Linux/Hetzner, default start method is usually fine.
     main()
