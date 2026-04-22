@@ -53,9 +53,13 @@ def score_kind_and_value(score: Optional[Tuple[str, int]]) -> Tuple[Optional[str
     return score[0], score[1]
 
 
-def weighted_cp_regret(ref_cp: int, bucket_cp: int, K: float = 100.0) -> int:
+def weighted_cp_regret(ref_cp, bucket_cp, K=100.0):
     raw = max(0, ref_cp - bucket_cp)
-    weight = 1.0 / (1.0 + abs(ref_cp) / K)
+    if ref_cp * bucket_cp < 0:
+        weight = 1.0
+    else:
+        avg_magnitude = (abs(ref_cp) + abs(bucket_cp)) / 2
+        weight = 1.0 / (1.0 + avg_magnitude / K)
     return int(round(raw * weight))
 
 
