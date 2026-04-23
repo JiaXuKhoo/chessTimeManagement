@@ -2,8 +2,7 @@
 run_tournament.py
 =================
 
-Parallel tournament runner with per-side TT isolation and lightweight
-per-game telemetry for report writing.
+Parallel tournament runner with per-side TT isolation.
 
 Policies tested:
   1. FixedUniform
@@ -22,14 +21,11 @@ IMPORTANT TT DESIGN
 3) Engines are restarted between games, so TT does NOT carry across games/matchups.
 4) For TokenBucket with probe features, TT persists across 2k, 5k and actual search.
 
-NEW TELEMETRY
--------------
-Per game, we log compact aggregate information that is useful for the report:
-- how many times each bucket was REQUESTED by TokenBucket
-- how many times each bucket BAND was actually spent
-- how many moves were token-limited
-- how many moves were remaining-budget-limited
-- how many moves were constrained by either
+MINIMAL EXTRA LOGGING
+---------------------
+Per game:
+- requested bucket counts (TokenBucket only; zero for other policies)
+- token-limited move count (TokenBucket only; zero for other policies)
 """
 
 import csv
@@ -52,7 +48,7 @@ import pandas as pd
 # =========================================================
 
 STOCKFISH_PATH = "stockfish"
-MODEL_PATH = "gbt_probe_tol20.joblib"
+MODEL_PATH = "gbt_probe_tol20.joblib"   # change if using static model
 OPENINGS_FILE = "openings_100.txt"
 RESULTS_DIR = "tournament_results_probe"
 
@@ -62,7 +58,8 @@ BUCKETS = [25_000, 100_000, 400_000, 1_600_000]
 SMALL_PROBE_NODES = 2_000
 LARGE_PROBE_NODES = 5_000
 
-INITIAL_MOVES_ESTIMATE = 64
+# 64 - 8 = 56
+INITIAL_MOVES_ESTIMATE = 56
 
 NUM_OPENINGS = None
 
@@ -80,7 +77,7 @@ RESIGN_CONSECUTIVE = 5
 HASH_MB = 128
 THREADS = 1
 
-# 16 vCPUs -> start with 8 workers, since each worker may have 2 active engines
+# 16 vCPUs -> 8 workers
 NUM_WORKERS = 8
 
 
@@ -106,6 +103,61 @@ def close_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
 
 
 # =========================================================
+# Moves-left helpers
+# =========================================================
+
+PIECE_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+}
+
+
+def get_total_material(board: chess.Board) -> int:
+    total = 0
+    for piece_type, value in PIECE_VALUES.items():
+        total += value * len(board.pieces(piece_type, chess.WHITE))
+        total += value * len(board.pieces(piece_type, chess.BLACK))
+    return total
+
+
+def estimate_moves_left_solak_vuckovic(board: chess.Board) -> int:
+    """
+    Šolak–Vučković material-based estimate.
+
+    Original formula gives remaining half-moves y:
+        y = x + 10               if x < 20
+        y = 3/8 * x + 22         if 20 <= x <= 60
+        y = 5/4 * x - 30         if x > 60
+
+    where x is total material value.
+
+    We convert to a side-move allocation estimate with int(y / 2),
+    matching your earlier implementation.
+    """
+    x = get_total_material(board)
+
+    if x < 20:
+        y = x + 10
+    elif x <= 60:
+        y = (3 / 8) * x + 22
+    else:
+        y = (5 / 4) * x - 30
+
+    return max(1, int(y / 2))
+
+
+def estimate_moves_left_hyatt(ply: int) -> int:
+    """
+    Old generic moves-left estimate used by Hyatt.
+    """
+    side_moves_played = ply // 2
+    return max(1, INITIAL_MOVES_ESTIMATE - side_moves_played)
+
+
+# =========================================================
 # Bucket helpers
 # =========================================================
 
@@ -114,22 +166,6 @@ def snap_to_bucket(nodes: float) -> int:
     if affordable:
         return max(affordable)
     return min(int(nodes), BUCKETS[0])
-
-
-def bucket_band(nodes: int) -> int:
-    """
-    Map any positive node count into one of the 4 report-friendly bands.
-    Examples:
-      10k   -> 25k band
-      70k   -> 100k band
-      300k  -> 400k band
-      900k  -> 1.6M band
-      2.0M  -> 1.6M band
-    """
-    for b in BUCKETS:
-        if nodes <= b:
-            return b
-    return BUCKETS[-1]
 
 
 def zero_bucket_counter() -> Counter:
@@ -266,7 +302,7 @@ def extract_probe_features(
     large_probe_nodes: int = LARGE_PROBE_NODES,
 ) -> Dict[str, Any]:
     """
-    Uses the SAME engine for:
+    SAME engine for:
       2k probe -> 5k probe
     so TT is shared across probe stages and the later actual search.
     """
@@ -315,15 +351,6 @@ def extract_probe_features(
 
 
 # =========================================================
-# Moves-left estimate
-# =========================================================
-
-def estimate_moves_left(ply: int) -> int:
-    side_moves_played = ply // 2
-    return max(1, INITIAL_MOVES_ESTIMATE - side_moves_played)
-
-
-# =========================================================
 # Allocation policies
 # =========================================================
 
@@ -333,9 +360,6 @@ class AllocationPolicy(ABC):
         self.total_budget = total_budget
         self.remaining_budget = total_budget
         self.use_discrete = use_discrete
-
-        self.moves_allocated = 0
-        self.final_bucket_counts = zero_bucket_counter()
 
     @abstractmethod
     def decide_nodes(
@@ -356,32 +380,17 @@ class AllocationPolicy(ABC):
             return snap_to_bucket(raw)
         return max(1, int(raw))
 
-    def record_allocation(self, chosen_nodes: int):
-        self.moves_allocated += 1
-        self.final_bucket_counts[bucket_band(chosen_nodes)] += 1
-
-    def export_game_metrics(self, prefix: str) -> Dict[str, Any]:
-        out = {
-            f"{prefix}_moves_allocated": self.moves_allocated,
-        }
-        for b in BUCKETS:
-            out[f"{prefix}_final_bucket_{b}_count"] = int(self.final_bucket_counts[b])
-
-        # Default zeros for non-TokenBucket policies
-        out[f"{prefix}_requested_bucket_25000_count"] = 0
-        out[f"{prefix}_requested_bucket_100000_count"] = 0
-        out[f"{prefix}_requested_bucket_400000_count"] = 0
-        out[f"{prefix}_requested_bucket_1600000_count"] = 0
-        out[f"{prefix}_token_limited_moves"] = 0
-        out[f"{prefix}_budget_limited_moves"] = 0
-        out[f"{prefix}_constrained_moves"] = 0
-
-        return out
-
     def reset(self):
         self.remaining_budget = self.total_budget
-        self.moves_allocated = 0
-        self.final_bucket_counts = zero_bucket_counter()
+
+    def export_game_metrics(self, prefix: str) -> Dict[str, Any]:
+        return {
+            f"{prefix}_requested_bucket_25000_count": 0,
+            f"{prefix}_requested_bucket_100000_count": 0,
+            f"{prefix}_requested_bucket_400000_count": 0,
+            f"{prefix}_requested_bucket_1600000_count": 0,
+            f"{prefix}_token_limited_moves": 0,
+        }
 
 
 class FixedUniformPolicy(AllocationPolicy):
@@ -399,7 +408,7 @@ class SolakVuckovicPolicy(AllocationPolicy):
         super().__init__("SolakVuckovic", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(ply)
+        moves_left = estimate_moves_left_solak_vuckovic(board)
         raw = self.remaining_budget / moves_left
         return self.finalise(raw)
 
@@ -409,7 +418,7 @@ class HyattPolicy(AllocationPolicy):
         super().__init__("Hyatt", total_budget, use_discrete)
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(ply)
+        moves_left = estimate_moves_left_hyatt(ply)
         target = self.remaining_budget / moves_left
 
         side_moves_played = ply // 2
@@ -445,18 +454,13 @@ class TokenBucketPolicy(AllocationPolicy):
 
         self.requested_bucket_counts = zero_bucket_counter()
         self.token_limited_moves = 0
-        self.budget_limited_moves = 0
-        self.constrained_moves = 0
 
     def reset(self):
         super().reset()
         self.tokens = float(self.burst_cap)
         self.refill_rate = self.total_budget / INITIAL_MOVES_ESTIMATE
-
         self.requested_bucket_counts = zero_bucket_counter()
         self.token_limited_moves = 0
-        self.budget_limited_moves = 0
-        self.constrained_moves = 0
 
     def set_debug_source_tag(self, tag: str):
         self.debug_source_tag = tag
@@ -494,24 +498,19 @@ class TokenBucketPolicy(AllocationPolicy):
         return X, row, raw_view
 
     def decide_nodes(self, engine, board, ply) -> int:
-        moves_left = estimate_moves_left(ply)
+        # Keep refill schedule on the old generic countdown
+        moves_left = estimate_moves_left_hyatt(ply)
         self.refill_rate = self.remaining_budget / moves_left
 
         X, sanitized_row, raw_view = self.build_feature_payload(engine, board)
         predicted = int(self.model.predict(X)[0])
 
-        requested_bucket = predicted if predicted in BUCKETS else bucket_band(max(1, predicted))
+        requested_bucket = predicted if predicted in BUCKETS else snap_to_bucket(max(1, predicted))
         self.requested_bucket_counts[requested_bucket] += 1
 
         token_limited = predicted > self.tokens
-        budget_limited = predicted > self.remaining_budget
-
         if token_limited:
             self.token_limited_moves += 1
-        if budget_limited:
-            self.budget_limited_moves += 1
-        if token_limited or budget_limited:
-            self.constrained_moves += 1
 
         spendable = min(predicted, self.tokens, self.remaining_budget)
         final_nodes = self.finalise(spendable)
@@ -551,13 +550,11 @@ class TokenBucketPolicy(AllocationPolicy):
             "fen": board.fen(),
             "uses_probe": self.uses_probe,
             "use_discrete": self.use_discrete,
-            "moves_left_estimate": moves_left,
             "remaining_budget_before": self.remaining_budget,
             "tokens_before": self.tokens,
             "predicted_raw": predicted,
             "requested_bucket": requested_bucket,
             "token_limited": int(token_limited),
-            "budget_limited": int(budget_limited),
             "spendable_before_finalise": spendable,
             "final_nodes": final_nodes,
             "feature_snapshot_raw": feature_snapshot,
@@ -572,18 +569,13 @@ class TokenBucketPolicy(AllocationPolicy):
         self.tokens = min(self.tokens + self.refill_rate, float(self.burst_cap))
 
     def export_game_metrics(self, prefix: str) -> Dict[str, Any]:
-        out = super().export_game_metrics(prefix)
-
-        out[f"{prefix}_requested_bucket_25000_count"] = int(self.requested_bucket_counts[25_000])
-        out[f"{prefix}_requested_bucket_100000_count"] = int(self.requested_bucket_counts[100_000])
-        out[f"{prefix}_requested_bucket_400000_count"] = int(self.requested_bucket_counts[400_000])
-        out[f"{prefix}_requested_bucket_1600000_count"] = int(self.requested_bucket_counts[1_600_000])
-
-        out[f"{prefix}_token_limited_moves"] = int(self.token_limited_moves)
-        out[f"{prefix}_budget_limited_moves"] = int(self.budget_limited_moves)
-        out[f"{prefix}_constrained_moves"] = int(self.constrained_moves)
-
-        return out
+        return {
+            f"{prefix}_requested_bucket_25000_count": int(self.requested_bucket_counts[25_000]),
+            f"{prefix}_requested_bucket_100000_count": int(self.requested_bucket_counts[100_000]),
+            f"{prefix}_requested_bucket_400000_count": int(self.requested_bucket_counts[400_000]),
+            f"{prefix}_requested_bucket_1600000_count": int(self.requested_bucket_counts[1_600_000]),
+            f"{prefix}_token_limited_moves": int(self.token_limited_moves),
+        }
 
 
 # =========================================================
@@ -605,36 +597,17 @@ class GameResult:
     white_nodes_total: int
     black_nodes_total: int
 
-    white_moves_allocated: int
-    black_moves_allocated: int
-
-    white_final_bucket_25000_count: int
-    white_final_bucket_100000_count: int
-    white_final_bucket_400000_count: int
-    white_final_bucket_1600000_count: int
-
-    black_final_bucket_25000_count: int
-    black_final_bucket_100000_count: int
-    black_final_bucket_400000_count: int
-    black_final_bucket_1600000_count: int
-
     white_requested_bucket_25000_count: int
     white_requested_bucket_100000_count: int
     white_requested_bucket_400000_count: int
     white_requested_bucket_1600000_count: int
+    white_token_limited_moves: int
 
     black_requested_bucket_25000_count: int
     black_requested_bucket_100000_count: int
     black_requested_bucket_400000_count: int
     black_requested_bucket_1600000_count: int
-
-    white_token_limited_moves: int
-    white_budget_limited_moves: int
-    white_constrained_moves: int
-
     black_token_limited_moves: int
-    black_budget_limited_moves: int
-    black_constrained_moves: int
 
 
 @dataclass
@@ -719,7 +692,6 @@ def play_one_game(
 
         nodes = policy.decide_nodes(engine, board, ply)
         nodes = max(1, min(nodes, policy.remaining_budget))
-        policy.record_allocation(nodes)
 
         info = engine.analyse(board, chess.engine.Limit(nodes=nodes))
         pv = info.get("pv", [])
@@ -900,10 +872,7 @@ def summarise_tokenbucket_logs(results: List[GameResult], a_name: str):
         return
 
     req = zero_bucket_counter()
-    finals = zero_bucket_counter()
     token_limited = 0
-    budget_limited = 0
-    constrained = 0
 
     for r in results:
         req[25_000] += r.white_requested_bucket_25000_count + r.black_requested_bucket_25000_count
@@ -911,20 +880,10 @@ def summarise_tokenbucket_logs(results: List[GameResult], a_name: str):
         req[400_000] += r.white_requested_bucket_400000_count + r.black_requested_bucket_400000_count
         req[1_600_000] += r.white_requested_bucket_1600000_count + r.black_requested_bucket_1600000_count
 
-        finals[25_000] += r.white_final_bucket_25000_count + r.black_final_bucket_25000_count
-        finals[100_000] += r.white_final_bucket_100000_count + r.black_final_bucket_100000_count
-        finals[400_000] += r.white_final_bucket_400000_count + r.black_final_bucket_400000_count
-        finals[1_600_000] += r.white_final_bucket_1600000_count + r.black_final_bucket_1600000_count
-
         token_limited += r.white_token_limited_moves + r.black_token_limited_moves
-        budget_limited += r.white_budget_limited_moves + r.black_budget_limited_moves
-        constrained += r.white_constrained_moves + r.black_constrained_moves
 
     print("  TokenBucket requested buckets:", dict(req))
-    print("  Actual final bucket bands    :", dict(finals))
     print(f"  Token-limited moves          : {token_limited}")
-    print(f"  Budget-limited moves         : {budget_limited}")
-    print(f"  Constrained moves            : {constrained}")
 
 
 def save_csv(results: List[GameResult], path: str):
@@ -974,13 +933,11 @@ def print_debug_summary(debug_rows: List[Dict[str, Any]]):
         print(f"turn_white                : {row['turn_white']}")
         print(f"uses_probe                : {row['uses_probe']}")
         print(f"use_discrete              : {row['use_discrete']}")
-        print(f"moves_left_estimate       : {row['moves_left_estimate']}")
         print(f"remaining_budget_before   : {row['remaining_budget_before']}")
         print(f"tokens_before             : {row['tokens_before']:.2f}")
         print(f"predicted_raw             : {row['predicted_raw']}")
         print(f"requested_bucket          : {row['requested_bucket']}")
         print(f"token_limited             : {row['token_limited']}")
-        print(f"budget_limited            : {row['budget_limited']}")
         print(f"spendable_before_finalise : {row['spendable_before_finalise']}")
         print(f"final_nodes               : {row['final_nodes']}")
         print(f"feature_snapshot_raw      : {row['feature_snapshot_raw']}")
