@@ -38,7 +38,7 @@ GEN_NODES = 10_000
 NUM_LINES = 1500
 
 # Evaluation: deeper search for accurate band assignment.
-EVAL_NODES = 100_000
+EVAL_NODES = 10_000_000
 
 # Eval bands: (min_abs_cp, max_abs_cp, num_to_sample)
 EVAL_BANDS = [
